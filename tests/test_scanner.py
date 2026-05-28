@@ -559,6 +559,36 @@ class TestScanIncrementalUpdate(unittest.TestCase):
         conn.close()
         self.assertEqual(session["last_timestamp"], "2026-04-08T09:10:00Z")
 
+    def test_new_session_first_timestamp_uses_earliest(self):
+        """A brand-new session discovered during an incremental scan with
+        non-monotonic timestamps must record the EARLIEST timestamp as
+        first_timestamp. Regression for the incremental branch only tracking
+        last_timestamp (parse_jsonl_file already tracked both)."""
+        self._write_initial()
+        scan(projects_dir=self.projects_dir.parent.parent, db_path=self.db_path, verbose=False)
+
+        # Append two records for a NEW session 'sess-2' with timestamps in
+        # reverse order — later one observed first, earlier one second.
+        import time
+        time.sleep(0.05)
+        with open(self.filepath, "a") as f:
+            f.write(_make_assistant_record(session_id="sess-2",
+                                           timestamp="2026-04-08T10:05:00Z",
+                                           input_tokens=50, output_tokens=25,
+                                           message_id="msg-new-2-late") + "\n")
+            f.write(_make_assistant_record(session_id="sess-2",
+                                           timestamp="2026-04-08T09:55:00Z",
+                                           input_tokens=70, output_tokens=35,
+                                           message_id="msg-new-2-early") + "\n")
+        scan(projects_dir=self.projects_dir.parent.parent, db_path=self.db_path, verbose=False)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        sess2 = conn.execute("SELECT * FROM sessions WHERE session_id = 'sess-2'").fetchone()
+        conn.close()
+        self.assertEqual(sess2["first_timestamp"], "2026-04-08T09:55:00Z")
+        self.assertEqual(sess2["last_timestamp"],  "2026-04-08T10:05:00Z")
+
     def test_mtime_change_without_growth_skipped(self):
         """If mtime changes but line count doesn't grow, skip the file."""
         self._write_initial()
