@@ -14,8 +14,9 @@ XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAs
 DB_PATH = Path.home() / ".claude" / "usage.db"
 DEFAULT_PROJECTS_DIRS = [PROJECTS_DIR, XCODE_PROJECTS_DIR]
 
-# Higher number = higher priority when choosing a session's primary model
-MODEL_PRIORITY = {"opus": 3, "sonnet": 2, "haiku": 1}
+# Higher number = higher priority when choosing a session's primary model.
+# Fable / Mythos are Anthropic's most capable class, so they outrank Opus.
+MODEL_PRIORITY = {"fable": 5, "mythos": 5, "opus": 3, "sonnet": 2, "haiku": 1}
 
 
 def _model_priority(model):

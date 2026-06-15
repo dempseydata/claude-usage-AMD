@@ -107,12 +107,16 @@ This applies to all agents working on this repo, not just Claude Code.
 
 The release flow:
 1. While work accumulates on `DEV`, the `## vX.Y.Z — TBD` heading at the top of `CHANGELOG.md` collects bullets. (For automated triage runs, see the routine note below.)
-2. When the maintainer is ready to release, they finalize the heading (`TBD` → today's date), merge `DEV → main` with `merge --no-ff` (so the release boundary is visible in `git log main`), and push `main`.
-3. [`.github/workflows/tag-on-merge.yml`](.github/workflows/tag-on-merge.yml) fires on the push, sees the new `## vX.Y.Z` heading in the CHANGELOG diff, and creates a lightweight tag at the merge commit. **No `git tag` step for the maintainer.**
+2. When the maintainer is ready to release, they finalize the heading (`TBD` → today's date), **bump `vscode-extension/package.json`'s `version` to match the CHANGELOG version** (the two ship in lockstep — the extension bundles the Python sources), merge `DEV → main` with `merge --no-ff` (so the release boundary is visible in `git log main`), and push `main`.
+3. [`.github/workflows/tag-on-merge.yml`](.github/workflows/tag-on-merge.yml) fires on the push, sees the new `## vX.Y.Z` heading in the CHANGELOG diff, and:
+   - creates a lightweight tag at the merge commit (**no `git tag` step for the maintainer**), then
+   - builds the VS Code extension `.vsix` and publishes a **GitHub Release** for that tag — the matching CHANGELOG section as the release notes, the built `.vsix` attached as a release asset.
 
-No formal `gh release create` at any cadence — the CHANGELOG entry IS the release notes, and the tag IS the release marker. If a particular release ever warrants a formal GitHub Release page (e.g. a major with breaking changes), it can be promoted retroactively from the existing tag.
+So every release is both a tag *and* a GitHub Release with the installable `.vsix` downloadable from it. This mirrors the manual procedure in the sibling `grok-build-vscode` repo (`scripts/release.*`: tag + `gh release create` with the `.vsix` attached), adapted to this repo's CHANGELOG-driven, merge-to-`main` model — so it's automated rather than a local script. Marketplace publish (`vsce publish`) stays separate and explicit, exactly as there.
 
-The workflow is idempotent: if the tag already exists (someone tagged manually before the workflow caught up), it's a no-op. It also no-ops on pushes that don't add a new version heading (typo fixes, docs-only edits, etc.).
+**The release step asserts `vscode-extension/package.json`'s version equals the CHANGELOG version and fails loudly if not** — the `.vsix` filename embeds the package version, so a mismatch would mislabel the asset. If you forget the bump, the tag is still created but the Release step fails; bump `package.json` and create the Release by hand (`gh release create vX.Y.Z --notes-file <section> vscode-extension/<name>-X.Y.Z.vsix`), since a same-commit re-push won't re-add the heading to re-trigger the workflow.
+
+The workflow is idempotent: if the tag already exists (someone tagged manually before the workflow caught up) the tag step is a no-op, and if the Release already exists the release step is a no-op. It also no-ops entirely on pushes that don't add a new version heading (typo fixes, docs-only edits, etc.).
 
 Existing tags `v1.0.0`, `v1.1.0`, `v1.1.1` are lightweight and were created by hand before the workflow existed. `v1.1.2` was the first tag created by the workflow. The workflow only *adds* missing tags; it never reconciles existing ones. Don't bother re-tagging the legacy ones.
 

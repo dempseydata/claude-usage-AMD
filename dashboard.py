@@ -18,6 +18,10 @@ def get_dashboard_data(db_path=DB_PATH):
         return {"error": "Database not found. Run: python cli.py scan"}
 
     conn = sqlite3.connect(db_path)
+    # The dashboard reads while a background scan may be committing (cmd_dashboard
+    # serves first, scans in a background thread; /api/rescan scans in-process too).
+    # Wait briefly for write locks instead of raising "database is locked".
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.row_factory = sqlite3.Row
 
     # ── All models (for filter UI) ────────────────────────────────────────────
@@ -386,7 +390,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <footer>
   <div class="footer-content">
-    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of May 2026. Only models containing <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
+    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of May 2026. Only models containing <em>fable</em>, <em>mythos</em>, <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
     <p>
       GitHub: <a href="https://github.com/phuryn/claude-usage" target="_blank">https://github.com/phuryn/claude-usage</a>
       &nbsp;&middot;&nbsp;
@@ -485,6 +489,10 @@ function tzDisplayName(tzMode) {
 
 // ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
 const PRICING = {
+  // Fable / Mythos — Anthropic's most capable class, priced at 2x Opus.
+  // (Mythos 5 shares Fable 5's pricing; Project-Glasswing access only.)
+  'claude-fable-5':    { input: 10.00, output: 50.00, cache_write: 12.50, cache_read: 1.00 },
+  'claude-mythos-5':   { input: 10.00, output: 50.00, cache_write: 12.50, cache_read: 1.00 },
   'claude-opus-4-7':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
   'claude-opus-4-6':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
   'claude-opus-4-5':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
@@ -499,7 +507,8 @@ const PRICING = {
 function isBillable(model) {
   if (!model) return false;
   const m = model.toLowerCase();
-  return m.includes('opus') || m.includes('sonnet') || m.includes('haiku');
+  return m.includes('fable') || m.includes('mythos') ||
+         m.includes('opus') || m.includes('sonnet') || m.includes('haiku');
 }
 
 function getPricing(model) {
@@ -509,6 +518,7 @@ function getPricing(model) {
     if (model.startsWith(key)) return PRICING[key];
   }
   const m = model.toLowerCase();
+  if (m.includes('fable') || m.includes('mythos')) return PRICING['claude-fable-5'];
   if (m.includes('opus'))   return PRICING['claude-opus-4-7'];
   if (m.includes('sonnet')) return PRICING['claude-sonnet-4-6'];
   if (m.includes('haiku'))  return PRICING['claude-haiku-4-5'];
@@ -675,10 +685,11 @@ function setHourlyTZ(mode) {
 // ── Model filter ───────────────────────────────────────────────────────────
 function modelPriority(m) {
   const ml = m.toLowerCase();
-  if (ml.includes('opus'))   return 0;
-  if (ml.includes('sonnet')) return 1;
-  if (ml.includes('haiku'))  return 2;
-  return 3;
+  if (ml.includes('fable') || ml.includes('mythos')) return 0;
+  if (ml.includes('opus'))   return 1;
+  if (ml.includes('sonnet')) return 2;
+  if (ml.includes('haiku'))  return 3;
+  return 4;
 }
 
 function readURLModels(allModels) {
@@ -1412,7 +1423,13 @@ async function loadData() {
     const resp = await fetch('/api/data');
     const d = await resp.json();
     if (d.error) {
-      document.body.innerHTML = '<div style="padding:40px;color:#C74E39">' + esc(d.error) + '</div>';
+      // The server binds and serves before the initial scan finishes, so on a
+      // fresh start the DB may not exist yet. Show a non-destructive notice and
+      // retry instead of nuking the page — once the background scan creates the
+      // DB, the next poll renders normally.
+      const meta = document.getElementById('meta');
+      if (meta) meta.innerHTML = esc(d.error) + ' — retrying…';
+      if (rawData === null) setTimeout(loadData, 3000);
       return;
     }
     const refreshNote = rangeIncludesToday(selectedRange) ? '<br>Auto-refresh in 30s' : '';

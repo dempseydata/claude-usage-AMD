@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.2.5 — 2026-06-15
+
+### Scanner / CLI
+
+- `cli.py dashboard` now binds and serves the port *first*, then runs the scan in a background thread, instead of scanning before starting the server. A cold scan over a large `~/.claude/projects` backlog can take over a minute, and the VS Code extension kills the dashboard process if it doesn't answer `/api/data` within ~10s — so the server was being killed long before it ever bound. The dashboard now comes up immediately and fills in data as the background scan commits.
+
+### Dashboard
+
+- Added Fable and Mythos to the pricing tables (both CLI and dashboard), priced at 2× Opus (input $10 / output $50 / MTok; cache-read $1.00, cache-write $12.50). `claude-mythos-5` shares `claude-fable-5`'s pricing. They're now billable, sort above Opus in the model filter, and resolve via the keyword fallback (`fable` / `mythos`).
+- The "no data yet" path no longer wipes the page — on a fresh start the server serves before the initial scan creates the DB, so `/api/data` can briefly return an error. The dashboard now shows a non-destructive "retrying…" notice and re-polls until the background scan produces data.
+- Added `PRAGMA busy_timeout = 5000` to the dashboard's read connection so reads wait briefly for the background scan's write locks instead of raising "database is locked".
+
+### Packaging
+
+- The auto-tag workflow ([.github/workflows/tag-on-merge.yml](.github/workflows/tag-on-merge.yml)) now also publishes a **GitHub Release** for each new version: it builds the VS Code extension `.vsix` and attaches it to the release, using the matching CHANGELOG section as the release notes. Tags and releases are deterministic projections of the CHANGELOG. The release step asserts `vscode-extension/package.json`'s version matches the CHANGELOG heading and fails loudly otherwise, so the `.vsix` asset is always correctly labelled. Bumped the extension to 1.2.5.
+
 ## v1.2.4 — 2026-05-30
 
 ### Dashboard

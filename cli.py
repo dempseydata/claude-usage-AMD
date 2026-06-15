@@ -17,6 +17,10 @@ from datetime import datetime, date, timedelta
 DB_PATH = Path.home() / ".claude" / "usage.db"
 
 PRICING = {
+    # Fable / Mythos — Anthropic's most capable class, priced at 2x Opus.
+    # (Mythos 5 shares Fable 5's pricing; Project-Glasswing access only.)
+    "claude-fable-5":    {"input": 10.00, "output": 50.00, "cache_read": 1.00, "cache_write": 12.50},
+    "claude-mythos-5":   {"input": 10.00, "output": 50.00, "cache_read": 1.00, "cache_write": 12.50},
     "claude-opus-4-7":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
     "claude-opus-4-6":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
     "claude-opus-4-5":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
@@ -38,6 +42,8 @@ def get_pricing(model):
             return PRICING[key]
     # Substring fallback: match model family by keyword
     m = model.lower()
+    if "fable" in m or "mythos" in m:
+        return PRICING["claude-fable-5"]
     if "opus" in m:
         return PRICING["claude-opus-4-7"]
     if "sonnet" in m:
@@ -358,21 +364,37 @@ def cmd_stats():
 
 
 def cmd_dashboard(projects_dir=None, host=None, port=None, no_browser=False):
-    print("Running scan first...")
-    cmd_scan(projects_dir=projects_dir)
+    import threading
+    import time
 
-    print("\nStarting dashboard server...")
     from dashboard import serve
 
     host = host or os.environ.get("HOST", "localhost")
     port = int(port or os.environ.get("PORT", "8080"))
 
+    # Bind and serve the port *first*, then scan in the background. A cold scan
+    # over a large ~/.claude/projects backlog can take well over a minute, and
+    # the VS Code extension kills the process if it doesn't answer /api/data
+    # within ~10s (see vscode-extension/src/server-manager.ts). Serving up front
+    # means the port is live immediately; the dashboard shows whatever's already
+    # in the DB and auto-refreshes as the background scan commits new data.
+    #
+    # Capture cmd_scan into a local so the background thread closes over the
+    # current binding — keeps the test suite's mock.patch(cli.cmd_scan) effective
+    # and prevents the thread from ever touching the real DB after a patch lifts.
+    scan = cmd_scan
+
+    def background_scan():
+        print("Scanning in the background...")
+        scan(projects_dir=projects_dir)
+        print("Background scan complete.")
+
+    threading.Thread(target=background_scan, daemon=True).start()
+
     # Open a browser for users running this as a script (see README). The VS Code
     # extension passes --no-browser since it embeds the dashboard in a webview.
     if not no_browser:
         import webbrowser
-        import threading
-        import time
 
         def open_browser():
             time.sleep(1.0)
