@@ -9,6 +9,14 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
 
+# Single source of truth for the app version reported by the CLI (`--version`)
+# and the dashboard footer. CHANGELOG.md is the canonical version reference, but
+# it isn't bundled into the .vsix — only the three Python files are — so the
+# runtime version has to live here as a constant. Keep this in lockstep with the
+# top CHANGELOG heading and vscode-extension/package.json (a parity test guards
+# all three; see tests/test_version.py).
+VERSION = "1.3.0"
+
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
 DB_PATH = Path.home() / ".claude" / "usage.db"

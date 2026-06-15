@@ -14,6 +14,8 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime, date, timedelta
 
+from scanner import VERSION
+
 DB_PATH = Path.home() / ".claude" / "usage.db"
 
 PRICING = {
@@ -364,7 +366,7 @@ def cmd_stats():
     conn.close()
 
 
-def cmd_dashboard(projects_dir=None, host=None, port=None, no_browser=False):
+def cmd_dashboard(projects_dir=None, host=None, port=None, no_browser=False, surface=None):
     import threading
     import time
 
@@ -403,7 +405,7 @@ def cmd_dashboard(projects_dir=None, host=None, port=None, no_browser=False):
 
         threading.Thread(target=open_browser, daemon=True).start()
 
-    serve(host=host, port=port)
+    serve(host=host, port=port, surface=surface)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -416,8 +418,9 @@ Usage:
   python cli.py today                        Show today's usage summary
   python cli.py week                         Show last 7 days (per-day + by-model)
   python cli.py stats                        Show all-time statistics
-  python cli.py dashboard [--projects-dir PATH] [--host HOST] [--port PORT] [--no-browser]
+  python cli.py dashboard [--projects-dir PATH] [--host HOST] [--port PORT] [--no-browser] [--surface SURFACE]
                                                  Scan + start dashboard (opens a browser unless --no-browser)
+  python cli.py --version                    Print the version and exit
 """
 
 COMMANDS = {
@@ -436,6 +439,10 @@ def parse_named_arg(args, flag):
     return None
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--version", "-V", "version"):
+        print(VERSION)
+        sys.exit(0)
+
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(USAGE)
         sys.exit(0)
@@ -450,6 +457,7 @@ if __name__ == "__main__":
             host=parse_named_arg(rest, "--host"),
             port=parse_named_arg(rest, "--port"),
             no_browser="--no-browser" in rest,
+            surface=parse_named_arg(rest, "--surface"),
         )
     elif command == "scan" and projects_dir:
         cmd_scan(projects_dir=projects_dir)

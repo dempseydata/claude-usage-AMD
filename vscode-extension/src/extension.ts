@@ -113,7 +113,10 @@ class Extension {
     const probeUrl = `http://${host}:${port}/api/data`;
     // --no-browser: the dashboard is embedded in the webview, so the bundled
     // cli.py must not also pop a system browser (it does by default for CLI users).
-    const spawnArgs = dashboardSpawnArgs(mode, python, ["--no-browser", "--host", host, "--port", String(port)]);
+    // --surface vscode: tells the dashboard it's embedded so its footer shows the
+    // version only — no "get the extension" promo (we're already in it) and no
+    // GitHub update check (VS Code updates the extension itself).
+    const spawnArgs = dashboardSpawnArgs(mode, python, ["--no-browser", "--host", host, "--port", String(port), "--surface", "vscode"]);
     if (!spawnArgs) {
       const msg = "Could not assemble a valid command to spawn the dashboard.";
       this.output.appendLine(msg);

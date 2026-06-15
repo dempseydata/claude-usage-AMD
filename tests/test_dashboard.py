@@ -383,6 +383,20 @@ class TestDashboardHTTP(unittest.TestCase):
         except urllib.error.HTTPError as e:
             self.assertEqual(e.code, 404)
 
+    def test_index_injects_app_config(self):
+        # do_GET must substitute the __APP_CONFIG_JSON__ placeholder with a real
+        # JSON object (version + surface). The raw placeholder must never reach
+        # the browser, or window.APP_CONFIG would be a syntax error.
+        from scanner import VERSION
+        url = f"http://127.0.0.1:{self.port}/"
+        with urllib.request.urlopen(url) as resp:
+            body = resp.read().decode("utf-8")
+        self.assertNotIn("__APP_CONFIG_JSON__", body)
+        self.assertIn("window.APP_CONFIG =", body)
+        self.assertIn(VERSION, body)
+        # The HTTP test server keeps the default surface ("web").
+        self.assertIn('"surface": "web"', body)
+
 
 class TestHTMLTemplate(unittest.TestCase):
     def test_template_is_valid_html(self):
@@ -425,6 +439,22 @@ class TestHTMLTemplate(unittest.TestCase):
         self.assertIn("'today': 1", HTML_TEMPLATE)
         # Bounds case: today returns start === end === today's ISO date
         self.assertIn("range === 'today'", HTML_TEMPLATE)
+
+    def test_app_config_placeholder_present(self):
+        """The head carries the server-substituted config placeholder and the
+        footer carries the element + JS the version/update feature drives."""
+        self.assertIn("__APP_CONFIG_JSON__", HTML_TEMPLATE)
+        self.assertIn("window.APP_CONFIG", HTML_TEMPLATE)
+        self.assertIn('id="footer-meta"', HTML_TEMPLATE)
+        self.assertIn("function initFooterMeta(", HTML_TEMPLATE)
+        self.assertIn("function checkForUpdate(", HTML_TEMPLATE)
+
+    def test_update_check_is_surface_gated(self):
+        """The GitHub update check and the extension promo are web-only: both
+        guard on surface !== 'vscode' so the embedded panel stays quiet."""
+        self.assertIn("APP_CONFIG.surface !== 'vscode'", HTML_TEMPLATE)
+        # The update check hits GitHub's public releases API, not any usage data.
+        self.assertIn("api.github.com/repos/phuryn/claude-usage/releases/latest", HTML_TEMPLATE)
 
 
 class TestPricingParity(unittest.TestCase):

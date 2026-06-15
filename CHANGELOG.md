@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.3.0 — 2026-06-15
+
+### Dashboard
+
+- The footer now shows the running version, linked to its GitHub release tag, on both the standalone web dashboard and the embedded VS Code panel (#135).
+- The standalone web dashboard now promotes the VS Code extension in the footer and, when a newer release is available, shows an **Update to vX.Y.Z** link to the latest GitHub release. The embedded panel shows neither — VS Code updates the extension itself, so it only displays the version. The dashboard learns its surface from a new `--surface` flag the extension passes (`--surface vscode`).
+- **Version check / privacy:** to power the update link, the standalone web dashboard now makes one unauthenticated request to GitHub's public releases API (`api.github.com/repos/phuryn/claude-usage/releases/latest`), cached in the browser for 24 hours and fully fail-silent (offline, blocked, or rate-limited simply hides the link). It sends **none** of your usage data — only a plain GET for the latest release number. The embedded VS Code panel makes no such request. Your transcripts and usage data never leave your machine.
+
+### Scanner / CLI
+
+- Added a single source-of-truth `VERSION` constant (`scanner.VERSION`) surfaced via `python cli.py --version`. It stays in lockstep with the top CHANGELOG heading and the extension's `package.json` (a parity test enforces all three match).
+
+### Project / docs
+
+- Rewrote the extension's local-install instructions: a prebuilt `.vsix` is now downloadable from every GitHub Release (no build step), and the build-from-source section gives a Windows-correct invocation (`powershell -ExecutionPolicy Bypass -File scripts\install.ps1`) — running `.\scripts\install.ps1` from Git Bash or by double-clicking just opens it in an editor.
+
 ## v1.2.6 — 2026-06-15
 
 ### Dashboard

@@ -18,16 +18,33 @@ Works on **API, Pro, and Max plans**. Captures usage from the Claude Code CLI, t
 
 Search the Extensions sidebar for **"Claude Code Usage"** (publisher: `PawelHuryn`), or open the marketplace link from the Open VSX page.
 
-### From a `.vsix` file (local install)
+### From a prebuilt `.vsix` (no build step)
+
+Every [GitHub Release](https://github.com/phuryn/claude-usage/releases/latest) attaches a ready-built `.vsix`. Download it, then either drag it onto the VS Code **Extensions** view, or run:
 
 ```
+code --install-extension claude-usage-phuryn-<version>.vsix
+```
+
+### Build and install from source
+
+Clone the repo and run the install script for your platform. Each script **builds** the `.vsix` (`npm install` + `vsce package`) and then installs it via `code --install-extension` — you don't need an existing `.vsix`, the script produces one.
+
+**macOS / Linux / WSL** (bash):
+
+```bash
 git clone https://github.com/phuryn/claude-usage
 cd claude-usage/vscode-extension
-./scripts/install.sh        # macOS / Linux / WSL
-.\scripts\install.ps1       # Windows PowerShell
+./scripts/install.sh
 ```
 
-The scripts run `vsce package` then `code --install-extension` against your local VS Code install.
+**Windows** — run the script *in PowerShell*. Invoking `.\scripts\install.ps1` from Git Bash (or double-clicking it) just opens the file in an editor, because Windows maps `.ps1` to "Edit", not "Run". The line below runs it regardless of which shell you're in or your execution-policy setting:
+
+```powershell
+git clone https://github.com/phuryn/claude-usage
+cd claude-usage/vscode-extension
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+```
 
 ---
 

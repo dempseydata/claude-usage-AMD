@@ -10,7 +10,18 @@ from urllib.parse import urlparse
 from pathlib import Path
 from datetime import datetime
 
+from scanner import VERSION
+
 DB_PATH = Path.home() / ".claude" / "usage.db"
+
+# Which surface is rendering the dashboard: "web" (standalone `cli.py dashboard`)
+# or "vscode" (embedded in the extension's sidebar webview). serve() sets this
+# from the --surface flag the extension passes. The footer reads it to decide
+# what to show — the web build promotes the VS Code extension and offers a
+# "check GitHub for a newer release" update link; the embedded build shows just
+# the version (VS Code updates the extension itself, and a GitHub-release check
+# would misfire there because the Marketplace publish lags the GitHub release).
+SURFACE = "web"
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -135,6 +146,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Claude Code Usage Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>window.APP_CONFIG = __APP_CONFIG_JSON__;</script>
 <style>
   :root {
     --bg: #161617;      /* page base */
@@ -258,6 +270,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .footer-content p:last-child { margin-bottom: 0; }
   .footer-content a { color: var(--blue); text-decoration: none; }
   .footer-content a:hover { text-decoration: underline; }
+  .footer-content a.update-link { color: var(--accent); font-weight: 600; }
 
   @media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } .chart-card.wide { grid-column: 1; } }
 </style>
@@ -398,6 +411,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       &nbsp;&middot;&nbsp;
       License: MIT
     </p>
+    <p id="footer-meta"></p>
   </div>
 </footer>
 
@@ -1471,6 +1485,82 @@ function scheduleAutoRefresh() {
   }
 }
 
+// ── Footer meta: version, extension promo, update check ──────────────────────
+// APP_CONFIG is injected server-side (see do_GET). { version, surface }.
+const APP_CONFIG = window.APP_CONFIG || { version: '', surface: 'web' };
+const REPO_URL = 'https://github.com/phuryn/claude-usage';
+const MARKETPLACE_URL = 'https://marketplace.visualstudio.com/items?itemName=PawelHuryn.claude-usage-phuryn';
+const UPDATE_CACHE_KEY = 'cu_update_check';
+const UPDATE_CACHE_TTL = 24 * 60 * 60 * 1000;  // re-check GitHub at most once a day
+
+// Compare dotted numeric versions ("1.3.0"); leading "v" tolerated. Returns
+// true only when `latest` is strictly ahead of `current`.
+function isNewer(latest, current) {
+  const a = String(latest).replace(/^v/, '').split('.').map(n => parseInt(n, 10) || 0);
+  const b = String(current).replace(/^v/, '').split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] || 0, y = b[i] || 0;
+    if (x > y) return true;
+    if (x < y) return false;
+  }
+  return false;
+}
+
+function appendUpdateLink(latest) {
+  const el = document.getElementById('footer-meta');
+  if (!el || !el.innerHTML) return;
+  const a = document.createElement('a');
+  a.className = 'update-link';
+  a.href = REPO_URL + '/releases/latest';
+  a.target = '_blank';
+  a.rel = 'noopener';
+  a.textContent = 'Update to v' + latest;
+  el.insertAdjacentHTML('beforeend', '&nbsp;&middot;&nbsp;');
+  el.appendChild(a);
+}
+
+// Web only. Asks GitHub's public releases API whether a newer release exists and,
+// if so, appends an "Update to vX.Y.Z" link. Cached in localStorage for 24h and
+// fully fail-silent (offline / rate-limited / blocked -> no link, no error). No
+// usage data is sent; this is a plain unauthenticated GET of release metadata.
+function checkForUpdate(current) {
+  let cached = null;
+  try { cached = JSON.parse(localStorage.getItem(UPDATE_CACHE_KEY) || 'null'); } catch (e) {}
+  if (cached && cached.latest && cached.ts && (Date.now() - cached.ts) < UPDATE_CACHE_TTL) {
+    if (isNewer(cached.latest, current)) appendUpdateLink(cached.latest);
+    return;
+  }
+  fetch('https://api.github.com/repos/phuryn/claude-usage/releases/latest', {
+    headers: { 'Accept': 'application/vnd.github+json' }
+  })
+    .then(r => r.ok ? r.json() : null)
+    .then(data => {
+      if (!data || !data.tag_name) return;
+      const latest = String(data.tag_name).replace(/^v/, '');
+      try { localStorage.setItem(UPDATE_CACHE_KEY, JSON.stringify({ ts: Date.now(), latest: latest })); } catch (e) {}
+      if (isNewer(latest, current)) appendUpdateLink(latest);
+    })
+    .catch(() => {});  // fail-silent: never let a version check disrupt the dashboard
+}
+
+function initFooterMeta() {
+  const el = document.getElementById('footer-meta');
+  if (!el) return;
+  const v = APP_CONFIG.version || '';
+  const parts = [];
+  if (v) {
+    parts.push('Version <a href="' + REPO_URL + '/releases/tag/v' + esc(v) + '" target="_blank" rel="noopener">v' + esc(v) + '</a>');
+  }
+  // The web build promotes the extension; the embedded build is already in it.
+  if (APP_CONFIG.surface !== 'vscode') {
+    parts.push('<a href="' + MARKETPLACE_URL + '" target="_blank" rel="noopener">Get the VS Code extension</a>');
+  }
+  el.innerHTML = parts.join('&nbsp;&middot;&nbsp;');
+  // VS Code auto-updates the extension, so only the web build checks for updates.
+  if (v && APP_CONFIG.surface !== 'vscode') checkForUpdate(v);
+}
+
+initFooterMeta();
 loadData();
 scheduleAutoRefresh();
 </script>
@@ -1510,10 +1600,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # URLs don't fall through to 404.
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
+            # Inject runtime config (version + surface) the page can't know at
+            # author time. json.dumps produces a valid JS object literal for the
+            # `window.APP_CONFIG = __APP_CONFIG_JSON__;` placeholder in the head.
+            config = json.dumps({"version": VERSION, "surface": SURFACE})
+            html = HTML_TEMPLATE.replace("__APP_CONFIG_JSON__", config)
+            body = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
+            self.wfile.write(body)
 
         elif path == "/api/data":
             data = get_dashboard_data()
@@ -1570,7 +1667,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 
-def serve(host=None, port=None):
+def serve(host=None, port=None, surface=None):
+    global SURFACE
+    if surface:
+        SURFACE = surface
     host = host or os.environ.get("HOST", "localhost")
     port = port or int(os.environ.get("PORT", "8080"))
     server = ThreadingHTTPServer((host, port), DashboardHandler)
