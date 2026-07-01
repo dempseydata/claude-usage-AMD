@@ -97,6 +97,11 @@ def init_db(conn):
             tool_use_count        INTEGER
         );
 
+        CREATE TABLE IF NOT EXISTS schema_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
         CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
         CREATE INDEX IF NOT EXISTS idx_sessions_first ON sessions(first_timestamp);
@@ -113,8 +118,11 @@ def init_db(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_subagent ON turns(is_subagent)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_agent_id ON turns(agent_id)")
     # Session topic (from custom-title / ai-title records; added in a later
-    # schema version)
-    _ensure_column(conn, "sessions", "topic", "TEXT")
+    # schema version). If we just added the column to an existing DB, flag a
+    # one-time backfill so the next scan re-reads the title records already
+    # present in transcripts scanned before topic support (see scan()).
+    if _ensure_column(conn, "sessions", "topic", "TEXT"):
+        _meta_set(conn, "topic_backfill_pending", "1")
     # Conditional unique index: only dedup non-null message IDs
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message_id
@@ -124,10 +132,30 @@ def init_db(conn):
 
 
 def _ensure_column(conn, table, column, decl):
-    """Add a column to an existing table if it isn't already present."""
+    """Add a column to an existing table if it isn't already present.
+
+    Returns True if the column was just added (an upgrade of an existing DB),
+    False if it was already there (fresh DB or already-migrated).
+    """
     cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        return True
+    return False
+
+
+def _meta_get(conn, key):
+    """Read a value from the schema_meta key/value table (None if absent)."""
+    row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def _meta_set(conn, key, value):
+    """Upsert a value into the schema_meta key/value table."""
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+        (key, value))
 
 
 def _extract_title(record):
@@ -138,6 +166,59 @@ def _extract_title(record):
     if rtype == "ai-title":
         return record.get("aiTitle")
     return None
+
+
+def _backfill_topics(conn, jsonl_files):
+    """One-time backfill of topics for a DB created before topic support.
+
+    Transcript files scanned before the topic column existed are already in
+    processed_files, so an incremental scan skips them and never sees the
+    custom-title / ai-title records they already contain. Re-read just those
+    records (turns are left untouched, so token totals cannot drift) and set the
+    topic for any session that doesn't have one yet. Runs once, gated by a flag
+    in schema_meta (see scan()). Returns the number of sessions filled.
+    """
+    needing = {r["session_id"] for r in conn.execute(
+        "SELECT session_id FROM sessions WHERE topic IS NULL OR topic = ''")}
+    if not needing:
+        return 0
+
+    titles = {}          # session_id -> chosen title
+    has_custom = set()   # sessions whose topic came from a custom-title record
+    for filepath in jsonl_files:
+        try:
+            with open(filepath, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    # Cheap prefilter: only title records carry the substring
+                    # "title" (in their "custom-title" / "ai-title" type), so we
+                    # skip JSON-parsing the ~99% of lines that are turns.
+                    if "title" not in line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    title = _extract_title(record)
+                    if not title:
+                        continue
+                    sid = record.get("sessionId")
+                    if sid not in needing:
+                        continue
+                    # custom-title wins; ai-title only if no custom-title seen.
+                    if record.get("type") == "custom-title":
+                        titles[sid] = title
+                        has_custom.add(sid)
+                    elif sid not in has_custom:
+                        titles.setdefault(sid, title)
+        except Exception as e:
+            print(f"  Warning: error reading {filepath}: {e}")
+
+    for sid, title in titles.items():
+        conn.execute(
+            "UPDATE sessions SET topic = ? WHERE session_id = ? "
+            "AND (topic IS NULL OR topic = '')", (title, sid))
+    conn.commit()
+    return len(titles)
 
 
 def project_name_from_cwd(cwd):
@@ -511,6 +592,18 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
             print(f"Scanning {d} ...")
         jsonl_files.extend(glob.glob(str(d / "**" / "*.jsonl"), recursive=True))
     jsonl_files.sort()
+
+    # One-time topic backfill for DBs that predate the topic column: fill topics
+    # from title records in already-processed transcripts that an incremental
+    # scan would otherwise never revisit. The schema_meta flag makes this run
+    # only on the first scan after the upgrade; afterwards it's normal
+    # incremental scanning.
+    if _meta_get(conn, "topic_backfill_pending") == "1":
+        filled = _backfill_topics(conn, jsonl_files)
+        _meta_set(conn, "topic_backfill_pending", "0")
+        conn.commit()
+        if verbose and filled:
+            print(f"Backfilled topic for {filled} existing session(s).")
 
     new_files = 0
     updated_files = 0

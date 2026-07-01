@@ -10,6 +10,7 @@ from pathlib import Path
 from scanner import (
     get_db, init_db, project_name_from_cwd, parse_jsonl_file,
     aggregate_sessions, upsert_sessions, insert_turns, scan,
+    _backfill_topics, _meta_get, _meta_set,
 )
 
 
@@ -850,6 +851,117 @@ class TestSessionTopicScan(unittest.TestCase):
         self._scan()
         self.assertEqual(self._topic("ghost"), "<<no row>>")  # no phantom row
         self.assertIsNone(self._topic("sess-1"))  # real session, just no title
+
+
+class TestTopicBackfill(unittest.TestCase):
+    """One-time backfill of topics for DBs that predate topic support (#147)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.projects_dir = Path(self.tmpdir) / "projects" / "user" / "proj"
+        self.projects_dir.mkdir(parents=True)
+        self.db_path = Path(self.tmpdir) / "usage.db"
+        self.filepath = self.projects_dir / "sess-1.jsonl"
+
+    def _scan(self):
+        return scan(projects_dir=self.projects_dir.parent.parent,
+                    db_path=self.db_path, verbose=False)
+
+    def _row(self, session_id="sess-1"):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM sessions WHERE session_id = ?",
+                           (session_id,)).fetchone()
+        conn.close()
+        return row
+
+    def _set_topic_null_and_flag(self):
+        """Simulate an upgraded, pre-topic DB: clear the captured topic and
+        re-arm the one-time backfill flag."""
+        conn = get_db(self.db_path)
+        conn.execute("UPDATE sessions SET topic = NULL WHERE session_id = 'sess-1'")
+        _meta_set(conn, "topic_backfill_pending", "1")
+        conn.commit()
+        conn.close()
+
+    def test_backfill_fills_topic_from_already_processed_file(self):
+        # A file with a title record is fully scanned, then we simulate the
+        # pre-topic state (topic NULL, flag armed). The file is unchanged, so the
+        # incremental scan skips it — only the backfill can refill the topic.
+        with open(self.filepath, "w") as f:
+            f.write(_make_user_record(session_id="sess-1",
+                                      timestamp="2026-04-08T09:00:00Z") + "\n")
+            f.write(_make_assistant_record(session_id="sess-1",
+                                           timestamp="2026-04-08T09:01:00Z") + "\n")
+            f.write(_make_custom_title_record(session_id="sess-1",
+                                              title="Backfilled topic") + "\n")
+        self._scan()
+        self._set_topic_null_and_flag()
+
+        result = self._scan()  # file unchanged -> skipped, but backfill runs
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(self._row()["topic"], "Backfilled topic")
+
+    def test_backfill_runs_only_once(self):
+        with open(self.filepath, "w") as f:
+            f.write(_make_user_record(session_id="sess-1",
+                                      timestamp="2026-04-08T09:00:00Z") + "\n")
+            f.write(_make_assistant_record(session_id="sess-1",
+                                           timestamp="2026-04-08T09:01:00Z") + "\n")
+            f.write(_make_ai_title_record(session_id="sess-1",
+                                          title="Only once") + "\n")
+        self._scan()
+        self._set_topic_null_and_flag()
+        self._scan()  # backfill fires, clears the flag
+        self.assertEqual(self._row()["topic"], "Only once")
+
+        # The one-time flag is now recorded as done.
+        conn = get_db(self.db_path)
+        self.assertEqual(_meta_get(conn, "topic_backfill_pending"), "0")
+        # Null the topic WITHOUT re-arming the flag: a later scan must not refill
+        # it (the one-time backfill already ran).
+        conn.execute("UPDATE sessions SET topic = NULL WHERE session_id = 'sess-1'")
+        conn.commit()
+        conn.close()
+        self._scan()
+        self.assertIsNone(self._row()["topic"])
+
+    def test_backfill_does_not_touch_token_totals(self):
+        with open(self.filepath, "w") as f:
+            f.write(_make_user_record(session_id="sess-1",
+                                      timestamp="2026-04-08T09:00:00Z") + "\n")
+            f.write(_make_assistant_record(session_id="sess-1",
+                                           timestamp="2026-04-08T09:01:00Z",
+                                           input_tokens=100, output_tokens=50) + "\n")
+            f.write(_make_custom_title_record(session_id="sess-1",
+                                              title="No drift") + "\n")
+        self._scan()
+        before = self._row()
+        self._set_topic_null_and_flag()
+        self._scan()
+        after = self._row()
+        self.assertEqual(after["topic"], "No drift")
+        # Tokens / turn count unchanged: backfill only reads title records.
+        self.assertEqual(after["total_input_tokens"], before["total_input_tokens"])
+        self.assertEqual(after["total_output_tokens"], before["total_output_tokens"])
+        self.assertEqual(after["turn_count"], before["turn_count"])
+
+    def test_backfill_unit_updates_only_sessions_missing_a_topic(self):
+        # Direct unit test: a session that already has a topic is not clobbered.
+        conn = get_db(self.db_path)
+        init_db(conn)
+        conn.execute("INSERT INTO sessions (session_id, topic) VALUES ('keep', 'existing')")
+        conn.execute("INSERT INTO sessions (session_id, topic) VALUES ('fill', NULL)")
+        conn.commit()
+        path = str(self.filepath)
+        with open(path, "w") as f:
+            f.write(_make_custom_title_record(session_id="keep", title="SHOULD NOT WIN") + "\n")
+            f.write(_make_ai_title_record(session_id="fill", title="filled") + "\n")
+        filled = _backfill_topics(conn, [path])
+        self.assertEqual(filled, 1)  # only 'fill' needed a topic
+        self.assertEqual(conn.execute("SELECT topic FROM sessions WHERE session_id='keep'").fetchone()[0], "existing")
+        self.assertEqual(conn.execute("SELECT topic FROM sessions WHERE session_id='fill'").fetchone()[0], "filled")
+        conn.close()
 
 
 if __name__ == "__main__":
