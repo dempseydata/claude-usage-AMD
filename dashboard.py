@@ -6,7 +6,7 @@ import json
 import os
 import sqlite3
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 from datetime import datetime
 
@@ -232,6 +232,90 @@ def get_dashboard_data(db_path=DB_PATH):
     }
 
 
+# strftime formats for the "Usage Timeline" chart's bucket resolution. Kept as
+# a fixed whitelist (never built from request input) so the granularity param
+# can't be used to smuggle an arbitrary format string into the query.
+TIMELINE_FORMATS = {
+    "minute": "%Y-%m-%d %H:%M",
+    "hour":   "%Y-%m-%d %H:00",
+}
+
+# Unlike daily_by_model/hourly_by_model above (which ship all history and let
+# the client filter by range), minute buckets over months of history would be
+# a huge payload — so minute granularity requires a bounded [start, end] no
+# wider than this many days. Enforced here, not just in the UI, since the
+# endpoint is a plain GET anyone could hit directly.
+TIMELINE_MINUTE_MAX_DAYS = 7
+
+
+def get_timeline_data(db_path=DB_PATH, granularity="hour", start=None, end=None):
+    """Per-bucket, per-project, per-model token usage for the Usage Timeline chart.
+
+    Queried fresh per request (scoped to start/end) rather than joining the
+    all-history blob get_dashboard_data returns, since minute/hour buckets
+    over unbounded history don't fit the "ship everything, filter on the
+    client" pattern the daily/hourly charts use.
+    """
+    if granularity not in TIMELINE_FORMATS:
+        return {"error": "invalid granularity: %r (expected 'minute' or 'hour')" % granularity}
+
+    if granularity == "minute":
+        if not start or not end:
+            return {"error": "minute granularity requires a bounded range (e.g. Today or This Week)"}
+        try:
+            span_days = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).days
+        except ValueError:
+            return {"error": "invalid start/end date"}
+        if span_days > TIMELINE_MINUTE_MAX_DAYS:
+            return {"error": "minute granularity is limited to a %d-day window" % TIMELINE_MINUTE_MAX_DAYS}
+
+    if not db_path.exists():
+        return {"error": "Database not found. Run: python cli.py scan"}
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.row_factory = sqlite3.Row
+    init_db(conn)
+
+    # Matches the daily_by_model/hourly_by_model convention of comparing the
+    # YYYY-MM-DD date prefix rather than full timestamps, so start/end from
+    # the client's getRangeBounds() (plain date strings) behave identically
+    # here as they do for those charts.
+    rows = conn.execute("""
+        SELECT
+            strftime(?, t.timestamp)                        as bucket,
+            COALESCE(NULLIF(s.project_name, ''), 'unknown') as project,
+            COALESCE(NULLIF(t.model, ''), 'unknown')        as model,
+            SUM(t.input_tokens)                             as input,
+            SUM(t.output_tokens)                            as output,
+            SUM(t.cache_read_tokens)                        as cache_read,
+            SUM(t.cache_creation_tokens)                     as cache_creation,
+            COUNT(*)                                        as turns
+        FROM turns t
+        LEFT JOIN sessions s ON s.session_id = t.session_id
+        WHERE t.timestamp IS NOT NULL AND length(t.timestamp) >= 13
+          AND (? IS NULL OR substr(t.timestamp, 1, 10) >= ?)
+          AND (? IS NULL OR substr(t.timestamp, 1, 10) <= ?)
+        GROUP BY bucket, project, t.model
+        ORDER BY bucket
+    """, (TIMELINE_FORMATS[granularity], start, start, end, end)).fetchall()
+    conn.close()
+
+    return {
+        "granularity": granularity,
+        "rows": [{
+            "bucket":         r["bucket"],
+            "project":        r["project"],
+            "model":          r["model"],
+            "input":          r["input"] or 0,
+            "output":         r["output"] or 0,
+            "cache_read":     r["cache_read"] or 0,
+            "cache_creation": r["cache_creation"] or 0,
+            "turns":          r["turns"] or 0,
+        } for r in rows],
+    }
+
+
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -239,6 +323,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Claude Code Usage Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
 <script>window.APP_CONFIG = __APP_CONFIG_JSON__;</script>
 <style>
   :root {
@@ -345,6 +430,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tz-btn:last-child { border-right: none; }
   .tz-btn:hover { background: var(--raised); color: var(--text); }
   .tz-btn.active { background: var(--selected); color: var(--text); }
+  .tz-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .timeline-body { display: flex; gap: 16px; }
+  .timeline-chart-wrap { flex: 1 1 70%; min-width: 0; }
+  .timeline-side { flex: 0 0 220px; max-height: 300px; overflow-y: auto; }
+  .timeline-side-title { font-size: 11px; color: var(--muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+  .timeline-side-table { width: 100%; font-size: 12px; border-collapse: collapse; }
+  .timeline-side-table th, .timeline-side-table td { padding: 4px 6px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .timeline-side-table th:first-child, .timeline-side-table td:first-child { text-align: left; overflow: hidden; text-overflow: ellipsis; max-width: 120px; }
+  .timeline-side-table th { color: var(--muted); font-weight: 600; }
+  .timeline-hint { font-size: 11px; color: var(--muted); margin: 10px 0 0; }
+  @media (max-width: 768px) { .timeline-body { flex-direction: column; } .timeline-side { flex: 0 0 auto; max-height: none; } }
   .peak-legend { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
   .peak-swatch { width: 10px; height: 10px; background: var(--red); border-radius: 2px; display: inline-block; }
 
@@ -486,6 +582,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="jump-panel">
       <button class="jump-link" data-target="sec-daily">Daily</button>
       <button class="jump-link" data-target="sec-hourly">Distribution</button>
+      <button class="jump-link" data-target="sec-timeline">Timeline</button>
       <button class="jump-link" data-target="sec-models">By Model</button>
       <button class="jump-link" data-target="sec-projects">Top Projects</button>
       <button class="jump-link" data-target="sec-subagents">Subagents</button>
@@ -526,6 +623,30 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
       </div>
       <div class="chart-wrap"><canvas id="chart-hourly"></canvas></div>
+    </div>
+    <div class="chart-card wide" id="sec-timeline" data-card="timeline">
+      <div class="chart-header">
+        <h2><span class="card-caret">&#9656;</span><span id="timeline-chart-title">Usage Timeline by Project</span></h2>
+        <div class="chart-header-right">
+          <span class="chart-day-count" id="timeline-note"></span>
+          <button class="tz-btn" id="timeline-reset-btn" onclick="resetTimelineSelection()" disabled>Reset selection</button>
+          <div class="tz-group">
+            <button class="tz-btn" data-gran="hour"   onclick="setTimelineGranularity('hour')">Hour</button>
+            <button class="tz-btn" data-gran="minute" onclick="setTimelineGranularity('minute')">Minute</button>
+          </div>
+        </div>
+      </div>
+      <div class="timeline-body">
+        <div class="chart-wrap tall timeline-chart-wrap"><canvas id="chart-timeline"></canvas></div>
+        <div class="timeline-side">
+          <div class="timeline-side-title" id="timeline-side-title">By Project — full range</div>
+          <table class="timeline-side-table">
+            <thead><tr><th>Project</th><th>Tokens</th></tr></thead>
+            <tbody id="timeline-project-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <p class="timeline-hint">Drag across the chart to select a time range. Double-click or "Reset selection" to clear.</p>
     </div>
     <div class="chart-card" id="sec-models" data-card="model-chart">
       <h2><span class="card-caret">&#9656;</span>By Model</h2>
@@ -868,7 +989,7 @@ Chart.defaults.plugins.tooltip.callbacks.labelColor = (ctx) => {
 // series the user toggled off. We track hidden series by label per chart and
 // reapply on rebuild: dataset charts via `dataset.hidden`, the doughnut via
 // per-slice data visibility (see applyModelHidden).
-const hiddenSeries = { daily: new Set(), hourly: new Set(), project: new Set(), model: new Set(), subagent: new Set() };
+const hiddenSeries = { daily: new Set(), hourly: new Set(), project: new Set(), model: new Set(), subagent: new Set(), timeline: new Set() };
 function legendToggle(key) {
   return (e, item, legend) => {
     const ci = legend.chart;
@@ -936,6 +1057,208 @@ function setRange(range) {
   updateURL();
   applyFilter();
   scheduleAutoRefresh();
+  fetchTimeline();  // range changed -> Usage Timeline is server-scoped, needs a fresh query
+}
+
+// ── Usage Timeline (minute/hour buckets grouped by project) ────────────────
+// Queried fresh per range/granularity change rather than folded into rawData
+// like the daily/hourly charts, since minute buckets over unbounded history
+// would be a huge payload (see get_timeline_data's docstring server-side).
+let timelineGranularity = 'hour';
+let timelineRawRows = [];
+
+function timelineRangeSpanDays() {
+  const { start, end } = getRangeBounds(selectedRange);
+  if (!start || !end) return null;  // unbounded range (All Time, or open-ended Nd ranges)
+  return (new Date(end) - new Date(start)) / 86400000;
+}
+
+function timelineMinuteAllowed() {
+  const span = timelineRangeSpanDays();
+  return span !== null && span <= 7;
+}
+
+function setTimelineGranularity(g) {
+  if (g === 'minute' && !timelineMinuteAllowed()) return;
+  timelineGranularity = g;
+  fetchTimeline();
+}
+
+function updateTimelineButtons() {
+  const minuteOk = timelineMinuteAllowed();
+  document.querySelectorAll('#sec-timeline .tz-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.gran === timelineGranularity);
+    if (btn.dataset.gran === 'minute') btn.disabled = !minuteOk;
+  });
+}
+
+async function fetchTimeline() {
+  if (timelineGranularity === 'minute' && !timelineMinuteAllowed()) timelineGranularity = 'hour';
+  updateTimelineButtons();
+
+  document.getElementById('timeline-chart-title').textContent =
+    'Usage Timeline by Project \u2014 ' + RANGE_LABELS[selectedRange];
+
+  const { start, end } = getRangeBounds(selectedRange);
+  const params = new URLSearchParams({ granularity: timelineGranularity });
+  if (start) params.set('start', start);
+  if (end) params.set('end', end);
+
+  const note = document.getElementById('timeline-note');
+  try {
+    const resp = await fetch('/api/timeline?' + params.toString());
+    const d = await resp.json();
+    if (d.error) {
+      if (note) note.textContent = d.error;
+      timelineRawRows = [];
+    } else {
+      if (note) note.textContent = '';
+      timelineRawRows = d.rows || [];
+    }
+  } catch (e) {
+    console.error(e);
+    timelineRawRows = [];
+  }
+  refilterTimeline();
+}
+
+// Client-side model re-filter of the already-fetched timeline rows — cheap,
+// so model checkbox toggles (which call applyFilter, not fetchTimeline) can
+// refresh this chart too without hitting the server again.
+function refilterTimeline() {
+  renderTimelineChart(timelineRawRows.filter(r => selectedModels.has(r.model)));
+}
+
+// Selection state for the drag-to-select range on the timeline chart. The
+// chart itself is destroyed/rebuilt on every range/granularity/model change
+// (same pattern as the rest of the dashboard), so an active drag-selection is
+// intentionally cleared whenever that happens — persisting it across a data
+// change isn't worth the extra bookkeeping.
+let timelineBuckets = [];
+let timelineFilteredRows = [];
+
+function renderTimelineChart(rows) {
+  timelineFilteredRows = rows;
+
+  const projTotals = {};
+  for (const r of rows) {
+    const tok = r.input + r.output + r.cache_read + r.cache_creation;
+    projTotals[r.project] = (projTotals[r.project] || 0) + tok;
+  }
+  // Cap series count so the stacked chart / legend stay readable — fold the
+  // long tail of smaller projects into "Other" rather than showing dozens.
+  const topProjects = Object.entries(projTotals)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([p]) => p);
+  const topSet = new Set(topProjects);
+  const hasOther = Object.keys(projTotals).length > topProjects.length;
+  const labels = hasOther ? [...topProjects, 'Other'] : topProjects;
+
+  const buckets = [...new Set(rows.map(r => r.bucket))].sort();
+  timelineBuckets = buckets;
+  const bucketIndex = new Map(buckets.map((b, i) => [b, i]));
+  const seriesMap = {};
+  for (const label of labels) seriesMap[label] = buckets.map(() => 0);
+  for (const r of rows) {
+    const key = topSet.has(r.project) ? r.project : (hasOther ? 'Other' : null);
+    if (!key) continue;
+    seriesMap[key][bucketIndex.get(r.bucket)] += r.input + r.output + r.cache_read + r.cache_creation;
+  }
+
+  const ctx = document.getElementById('chart-timeline').getContext('2d');
+  if (charts.timeline) charts.timeline.destroy();
+  if (!buckets.length) { charts.timeline = null; renderTimelineProjectTable(rows, null); return; }
+
+  charts.timeline = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: buckets,
+      datasets: labels.map((label, i) => ({
+        label,
+        hidden: hiddenSeries.timeline.has(label),
+        data: seriesMap[label],
+        backgroundColor: MODEL_COLORS[i % MODEL_COLORS.length],
+        hoverBackgroundColor: MODEL_COLORS[i % MODEL_COLORS.length],
+        stack: 'timeline',
+      })),
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { onClick: legendToggle('timeline'), labels: { color: C.axis, boxWidth: 12 } },
+        // Drag across the bars to zoom into a range — chartjs-plugin-zoom
+        // (loaded via CDN alongside Chart.js) auto-registers against the
+        // global Chart object, no explicit Chart.register() needed. Pan is
+        // off so drag always means "select a range", not "scroll the chart".
+        zoom: {
+          zoom: {
+            drag: { enabled: true, backgroundColor: 'rgba(217,119,87,0.25)', borderColor: 'rgba(217,119,87,0.6)', borderWidth: 1 },
+            mode: 'x',
+            onZoomComplete: ({ chart }) => applyTimelineSelectionFromChart(chart),
+          },
+          pan: { enabled: false },
+          limits: { x: { min: 0, max: Math.max(buckets.length - 1, 0), minRange: 1 } },
+        },
+      },
+      scales: {
+        x: { stacked: true, ticks: { color: C.axis, maxTicksLimit: 15 }, grid: { color: C.border } },
+        y: { stacked: true, ticks: { color: C.axis }, grid: { color: C.border } },
+      },
+    },
+  });
+
+  // Double-click resets the selection. chartjs-plugin-zoom's drag mode
+  // doesn't add its own reset gesture, so this is wired directly on the
+  // canvas rather than through a chart option.
+  ctx.canvas.ondblclick = resetTimelineSelection;
+
+  renderTimelineProjectTable(rows, null);
+}
+
+// Reads the zoomed x-axis range (bar-index based, since our x scale is a
+// category/labels axis) off the chart and re-aggregates the project subtotal
+// table to just the selected buckets. Falls back to the full range if the
+// drag ended up covering everything (no real selection).
+function applyTimelineSelectionFromChart(chart) {
+  const xScale = chart.scales.x;
+  if (!xScale || !timelineBuckets.length) return;
+  const minIdx = Math.max(0, Math.round(xScale.min));
+  const maxIdx = Math.min(timelineBuckets.length - 1, Math.round(xScale.max));
+  if (minIdx <= 0 && maxIdx >= timelineBuckets.length - 1) {
+    renderTimelineProjectTable(timelineFilteredRows, null);
+    return;
+  }
+  const selectedBuckets = new Set(timelineBuckets.slice(minIdx, maxIdx + 1));
+  const subset = timelineFilteredRows.filter(r => selectedBuckets.has(r.bucket));
+  renderTimelineProjectTable(subset, { start: timelineBuckets[minIdx], end: timelineBuckets[maxIdx] });
+}
+
+function resetTimelineSelection() {
+  if (charts.timeline && charts.timeline.resetZoom) charts.timeline.resetZoom();
+  renderTimelineProjectTable(timelineFilteredRows, null);
+}
+
+function renderTimelineProjectTable(rows, range) {
+  const projMap = {};
+  for (const r of rows) {
+    const tok = r.input + r.output + r.cache_read + r.cache_creation;
+    projMap[r.project] = (projMap[r.project] || 0) + tok;
+  }
+  const sorted = Object.entries(projMap).sort((a, b) => b[1] - a[1]);
+
+  const titleEl = document.getElementById('timeline-side-title');
+  if (titleEl) titleEl.textContent = range ? 'By Project — ' + range.start + ' to ' + range.end : 'By Project — full range';
+
+  const resetBtn = document.getElementById('timeline-reset-btn');
+  if (resetBtn) resetBtn.disabled = !range;
+
+  const body = document.getElementById('timeline-project-body');
+  if (!body) return;
+  body.innerHTML = sorted.length
+    ? sorted.map(([project, tokens]) => '<tr><td title="' + esc(project) + '">' + esc(project) + '</td><td>' + tokens.toLocaleString() + '</td></tr>').join('')
+    : '<tr><td colspan="2">No data</td></tr>';
 }
 
 function setHourlyTZ(mode) {
@@ -1291,6 +1614,7 @@ function applyFilter() {
   renderModelChart(byModel);
   renderProjectChart(byProject);
   renderSubagentChart(byAgentType);
+  refilterTimeline();  // cheap client-side re-filter of already-fetched timeline rows
   lastFilteredDispatches = filteredDispatches;
   renderTopDispatches(lastFilteredDispatches);
   lastFilteredSessions = sortSessions(filteredSessions);
@@ -1936,6 +2260,7 @@ async function loadData() {
       updateModelSortIcons();
       updateProjectSortIcons();
       updateProjectBranchSortIcons();
+      fetchTimeline();
     }
 
     applyFilter();
@@ -2226,6 +2551,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             data = get_dashboard_data(DB_PATH)
             body = json.dumps(data).encode("utf-8")
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif path == "/api/timeline":
+            qs = parse_qs(urlparse(self.path).query)
+            granularity = qs.get("granularity", ["hour"])[0]
+            start = qs.get("start", [None])[0] or None
+            end = qs.get("end", [None])[0] or None
+            data = get_timeline_data(DB_PATH, granularity=granularity, start=start, end=end)
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(400 if "error" in data else 200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()

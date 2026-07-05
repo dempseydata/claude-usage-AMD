@@ -6,11 +6,12 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 from scanner import get_db, init_db, upsert_sessions, insert_turns
-from dashboard import get_dashboard_data, DashboardHandler, HTML_TEMPLATE
+from dashboard import get_dashboard_data, get_timeline_data, DashboardHandler, HTML_TEMPLATE
 
 try:
     from http.server import HTTPServer
@@ -124,6 +125,104 @@ class TestGetDashboardData(unittest.TestCase):
         self.assertTrue(all("day" in r and "model" in r for r in rows))
         self.assertTrue(all(r["model"] == "claude-sonnet-4-6" for r in rows))
         self.assertTrue(all(r["day"] == "2026-04-08" for r in rows))
+
+
+class TestGetTimelineData(unittest.TestCase):
+    """Tests for the Usage Timeline chart's project-grouped minute/hour buckets."""
+
+    def setUp(self):
+        self.tmpfile = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmpfile.close()
+        self.db_path = Path(self.tmpfile.name)
+        conn = get_db(self.db_path)
+        init_db(conn)
+        upsert_sessions(conn, [
+            {
+                "session_id": "sess-abc123", "project_name": "user/myproject",
+                "first_timestamp": "2026-04-08T09:00:00Z",
+                "last_timestamp": "2026-04-08T10:00:00Z",
+                "git_branch": "main", "model": "claude-sonnet-4-6",
+                "total_input_tokens": 5000, "total_output_tokens": 2000,
+                "total_cache_read": 500, "total_cache_creation": 200,
+                "turn_count": 10,
+            },
+            {
+                "session_id": "sess-def456", "project_name": "user/otherproject",
+                "first_timestamp": "2026-04-08T09:00:00Z",
+                "last_timestamp": "2026-04-08T09:05:00Z",
+                "git_branch": "main", "model": "claude-sonnet-4-6",
+                "total_input_tokens": 100, "total_output_tokens": 50,
+                "total_cache_read": 0, "total_cache_creation": 0,
+                "turn_count": 1,
+            },
+        ])
+        insert_turns(conn, [
+            {
+                "session_id": "sess-abc123", "timestamp": "2026-04-08T09:30:00Z",
+                "model": "claude-sonnet-4-6", "input_tokens": 500,
+                "output_tokens": 200, "cache_read_tokens": 50,
+                "cache_creation_tokens": 20, "tool_name": None, "cwd": "/tmp",
+            },
+            {
+                "session_id": "sess-abc123", "timestamp": "2026-04-08T09:31:00Z",
+                "model": "claude-sonnet-4-6", "input_tokens": 300,
+                "output_tokens": 150, "cache_read_tokens": 0,
+                "cache_creation_tokens": 0, "tool_name": None, "cwd": "/tmp",
+            },
+            {
+                "session_id": "sess-def456", "timestamp": "2026-04-08T09:30:00Z",
+                "model": "claude-sonnet-4-6", "input_tokens": 100,
+                "output_tokens": 50, "cache_read_tokens": 0,
+                "cache_creation_tokens": 0, "tool_name": None, "cwd": "/tmp",
+            },
+        ])
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    def test_rejects_invalid_granularity(self):
+        data = get_timeline_data(db_path=self.db_path, granularity="day")
+        self.assertIn("error", data)
+
+    def test_minute_requires_bounded_range(self):
+        data = get_timeline_data(db_path=self.db_path, granularity="minute")
+        self.assertIn("error", data)
+
+    def test_minute_rejects_wide_range(self):
+        data = get_timeline_data(
+            db_path=self.db_path, granularity="minute",
+            start="2026-01-01", end="2026-04-08",
+        )
+        self.assertIn("error", data)
+
+    def test_minute_buckets_within_bounded_range(self):
+        data = get_timeline_data(
+            db_path=self.db_path, granularity="minute",
+            start="2026-04-08", end="2026-04-08",
+        )
+        self.assertNotIn("error", data)
+        buckets = {r["bucket"] for r in data["rows"]}
+        self.assertIn("2026-04-08 09:30", buckets)
+        self.assertIn("2026-04-08 09:31", buckets)
+
+    def test_hour_groups_across_projects(self):
+        data = get_timeline_data(
+            db_path=self.db_path, granularity="hour",
+            start="2026-04-08", end="2026-04-08",
+        )
+        self.assertNotIn("error", data)
+        by_project = {r["project"]: r for r in data["rows"]}
+        self.assertIn("user/myproject", by_project)
+        self.assertIn("user/otherproject", by_project)
+        # Both turns for myproject land in the 09:00 bucket -> summed tokens
+        self.assertEqual(by_project["user/myproject"]["input"], 800)
+        self.assertEqual(by_project["user/otherproject"]["input"], 100)
+
+    def test_missing_db_returns_error(self):
+        data = get_timeline_data(db_path=Path("/nonexistent/path/usage.db"), granularity="hour")
+        self.assertIn("error", data)
 
 
 class TestEmptyStringModelNormalization(unittest.TestCase):
@@ -318,6 +417,21 @@ class TestDashboardHTTP(unittest.TestCase):
             data = json.loads(resp.read())
             # Should have expected keys (or error if no DB)
             self.assertTrue("all_models" in data or "error" in data)
+
+    def test_api_timeline_returns_json(self):
+        url = f"http://127.0.0.1:{self.port}/api/timeline?granularity=hour"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn("application/json", resp.headers["Content-Type"])
+            data = json.loads(resp.read())
+            self.assertEqual(data["granularity"], "hour")
+            self.assertIn("rows", data)
+
+    def test_api_timeline_rejects_invalid_granularity(self):
+        url = f"http://127.0.0.1:{self.port}/api/timeline?granularity=week"
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(url)
+        self.assertEqual(ctx.exception.code, 400)
 
     def test_api_rescan_returns_json(self):
         url = f"http://127.0.0.1:{self.port}/api/rescan"
