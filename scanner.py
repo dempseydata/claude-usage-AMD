@@ -247,6 +247,43 @@ def _backfill_topics(conn, jsonl_files):
     return len(titles)
 
 
+def _backfill_cli_skill_names(conn, jsonl_files):
+    """One-time backfill of skill_name/cli_name for turns scanned before those
+    columns existed. Same rationale as _backfill_topics: files already in
+    processed_files are never revisited by an incremental scan, so their
+    Bash/Skill turns stay NULL forever unless re-read here. Runs once, gated
+    by schema_meta (see scan()). Returns the number of turns filled.
+    """
+    needing = {r["message_id"] for r in conn.execute(
+        "SELECT message_id FROM turns WHERE tool_name IN ('Bash', 'Skill') "
+        "AND skill_name IS NULL AND cli_name IS NULL "
+        "AND message_id IS NOT NULL AND message_id != ''")}
+    if not needing:
+        return 0
+
+    filled = 0
+    for filepath in jsonl_files:
+        try:
+            _, turns, _, _ = parse_jsonl_file(filepath)
+        except Exception as e:
+            print(f"  Warning: error reading {filepath}: {e}")
+            continue
+        for t in turns:
+            mid = t.get("message_id")
+            if mid not in needing:
+                continue
+            skill_name, cli_name = t.get("skill_name"), t.get("cli_name")
+            if skill_name is None and cli_name is None:
+                continue
+            conn.execute(
+                "UPDATE turns SET skill_name = ?, cli_name = ? "
+                "WHERE message_id = ? AND skill_name IS NULL AND cli_name IS NULL",
+                (skill_name, cli_name, mid))
+            filled += 1
+    conn.commit()
+    return filled
+
+
 def project_name_from_cwd(cwd):
     """Derive a friendly project name from cwd path."""
     if not cwd:
@@ -640,6 +677,16 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
         conn.commit()
         if verbose and filled:
             print(f"Backfilled topic for {filled} existing session(s).")
+
+    # Same one-time-backfill pattern for skill_name/cli_name: those columns
+    # were added after cli_name/skill_name extraction, so files scanned before
+    # then have NULL Bash/Skill turns an incremental scan would never revisit.
+    if _meta_get(conn, "cli_skill_backfill_done") != "1":
+        filled = _backfill_cli_skill_names(conn, jsonl_files)
+        _meta_set(conn, "cli_skill_backfill_done", "1")
+        conn.commit()
+        if verbose and filled:
+            print(f"Backfilled skill_name/cli_name for {filled} existing turn(s).")
 
     new_files = 0
     updated_files = 0

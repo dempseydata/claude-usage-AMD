@@ -1024,5 +1024,85 @@ class TestTopicBackfill(unittest.TestCase):
         conn.close()
 
 
+def _make_bash_record(session_id="sess-1", timestamp="2026-04-08T10:00:00Z",
+                      message_id="", command="openspec new change x"):
+    return json.dumps({
+        "type": "assistant",
+        "sessionId": session_id,
+        "timestamp": timestamp,
+        "cwd": "/home/user/project",
+        "message": {
+            "id": message_id, "model": "claude-sonnet-4-6",
+            "usage": {"input_tokens": 100, "output_tokens": 50,
+                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            "content": [{"type": "tool_use", "name": "Bash",
+                         "input": {"command": command}}],
+        },
+    })
+
+
+class TestCliSkillNameBackfill(unittest.TestCase):
+    """One-time backfill of skill_name/cli_name for turns scanned before those
+    columns existed (mirrors TestTopicBackfill for #147's same class of bug)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.projects_dir = Path(self.tmpdir) / "projects" / "user" / "proj"
+        self.projects_dir.mkdir(parents=True)
+        self.db_path = Path(self.tmpdir) / "usage.db"
+        self.filepath = self.projects_dir / "sess-1.jsonl"
+
+    def _scan(self):
+        return scan(projects_dir=self.projects_dir.parent.parent,
+                    db_path=self.db_path, verbose=False)
+
+    def _turn_row(self, message_id="m1"):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM turns WHERE message_id = ?",
+                           (message_id,)).fetchone()
+        conn.close()
+        return row
+
+    def test_backfill_fills_cli_name_from_already_processed_file(self):
+        with open(self.filepath, "w") as f:
+            f.write(_make_bash_record(message_id="m1",
+                                      command="openspec new change x") + "\n")
+        self._scan()
+        # Simulate a pre-cli_name DB: null the field, clear the file's
+        # unchanged-mtime state never applies here since insert used
+        # INSERT OR IGNORE -- directly null the column and re-arm the flag.
+        conn = get_db(self.db_path)
+        conn.execute("UPDATE turns SET cli_name = NULL WHERE message_id = 'm1'")
+        conn.execute("DELETE FROM schema_meta WHERE key = 'cli_skill_backfill_done'")
+        conn.commit()
+        conn.close()
+
+        result = self._scan()  # file unchanged -> skipped, only backfill can fix it
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(self._turn_row("m1")["cli_name"], "openspec")
+
+    def test_backfill_runs_only_once(self):
+        with open(self.filepath, "w") as f:
+            f.write(_make_bash_record(message_id="m1", command="grep foo") + "\n")
+        self._scan()
+        conn = get_db(self.db_path)
+        conn.execute("UPDATE turns SET cli_name = NULL WHERE message_id = 'm1'")
+        conn.execute("DELETE FROM schema_meta WHERE key = 'cli_skill_backfill_done'")
+        conn.commit()
+        conn.close()
+        self._scan()
+        self.assertEqual(self._turn_row("m1")["cli_name"], "grep")
+
+        conn = get_db(self.db_path)
+        self.assertEqual(_meta_get(conn, "cli_skill_backfill_done"), "1")
+        # Null it again WITHOUT re-arming the flag: a later scan must not refill.
+        conn.execute("UPDATE turns SET cli_name = NULL WHERE message_id = 'm1'")
+        conn.commit()
+        conn.close()
+        self._scan()
+        self.assertIsNone(self._turn_row("m1")["cli_name"])
+
+
 if __name__ == "__main__":
     unittest.main()
