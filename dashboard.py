@@ -219,6 +219,68 @@ def get_dashboard_data(db_path=DB_PATH):
         "status":         r["status"],
     } for r in top_dispatch_rows]
 
+    # ── Skill usage, by day & model (client filters by range + model) ─────────
+    # skill_name is only populated for tool_name='Skill' turns (see scanner.py) —
+    # every other turn has it NULL and is excluded here.
+    skill_daily_rows = conn.execute("""
+        SELECT
+            substr(timestamp, 1, 10)                 as day,
+            skill_name                                as skill,
+            COALESCE(NULLIF(model, ''), 'unknown')    as model,
+            SUM(input_tokens)                         as input,
+            SUM(output_tokens)                        as output,
+            SUM(cache_read_tokens)                    as cache_read,
+            SUM(cache_creation_tokens)                as cache_creation,
+            COUNT(*)                                  as turns
+        FROM turns
+        WHERE skill_name IS NOT NULL AND skill_name != ''
+        GROUP BY day, skill, model
+        ORDER BY day, skill
+    """).fetchall()
+
+    skill_by_day = [{
+        "day":            r["day"],
+        "skill":          r["skill"],
+        "model":          r["model"],
+        "input":          r["input"] or 0,
+        "output":         r["output"] or 0,
+        "cache_read":     r["cache_read"] or 0,
+        "cache_creation": r["cache_creation"] or 0,
+        "turns":          r["turns"] or 0,
+    } for r in skill_daily_rows]
+
+    # ── Tool usage, by day & model (client filters by range + model) ──────────
+    # Raw tool_name per row (e.g. "Bash", "mcp__playwright__browser_click") —
+    # the client collapses "mcp__<server>__<tool>" down to its MCP server for
+    # the "Token Usage by MCP / CLI" table, same all-history-shipped pattern
+    # as daily_by_model.
+    tool_daily_rows = conn.execute("""
+        SELECT
+            substr(timestamp, 1, 10)                 as day,
+            tool_name                                 as tool_name,
+            COALESCE(NULLIF(model, ''), 'unknown')    as model,
+            SUM(input_tokens)                         as input,
+            SUM(output_tokens)                        as output,
+            SUM(cache_read_tokens)                    as cache_read,
+            SUM(cache_creation_tokens)                as cache_creation,
+            COUNT(*)                                  as turns
+        FROM turns
+        WHERE tool_name IS NOT NULL AND tool_name != ''
+        GROUP BY day, tool_name, model
+        ORDER BY day, tool_name
+    """).fetchall()
+
+    tool_by_day = [{
+        "day":            r["day"],
+        "tool_name":      r["tool_name"],
+        "model":          r["model"],
+        "input":          r["input"] or 0,
+        "output":         r["output"] or 0,
+        "cache_read":     r["cache_read"] or 0,
+        "cache_creation": r["cache_creation"] or 0,
+        "turns":          r["turns"] or 0,
+    } for r in tool_daily_rows]
+
     conn.close()
 
     return {
@@ -228,6 +290,8 @@ def get_dashboard_data(db_path=DB_PATH):
         "sessions_all":    sessions_all,
         "subagent_by_type": subagent_by_type,
         "top_dispatches":  top_dispatches,
+        "skill_by_day":    skill_by_day,
+        "tool_by_day":     tool_by_day,
         "generated_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -243,9 +307,10 @@ TIMELINE_FORMATS = {
 # Unlike daily_by_model/hourly_by_model above (which ship all history and let
 # the client filter by range), minute buckets over months of history would be
 # a huge payload — so minute granularity requires a bounded [start, end] no
-# wider than this many days. Enforced here, not just in the UI, since the
-# endpoint is a plain GET anyone could hit directly.
-TIMELINE_MINUTE_MAX_DAYS = 7
+# wider than this many days. The UI only ever offers minute view for Today/
+# Yesterday (single-day ranges), but this is enforced here too, not just in
+# the UI, since the endpoint is a plain GET anyone could hit directly.
+TIMELINE_MINUTE_MAX_DAYS = 1
 
 
 def get_timeline_data(db_path=DB_PATH, granularity="hour", start=None, end=None):
@@ -338,7 +403,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --red: #C74E39;
     --raised: #2E2F31;  /* hover / raised surfaces — top of the elevation ladder */
     --selected: #262626;  /* selected chips / tabs (neutral, not accent) */
-    --jump-h: 45px;  /* sticky jump-bar height; JS keeps it in sync for scroll offsets */
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
@@ -485,32 +549,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
      the same control strip. It pins to the viewport top once the header/filter
      scroll away. z-index sits below the model panel (50) so the dropdown still
      overlays it. */
-  /* Sticky table-of-contents for the long report: three compact entries —
-     Overview, plus Graphs and Tables menus that reveal their sections on hover
-     (or keyboard focus). Stays small so it never crowds the narrow VS Code panel. */
-  #jump-bar { position: sticky; top: 0; z-index: 20; background: var(--card); border-bottom: 1px solid var(--border); padding: 7px 24px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; box-shadow: 0 2px 8px rgba(0,0,0,0.18); }
-  .jump-menu { position: relative; }
-  .jump-trigger { display: inline-flex; align-items: center; gap: 6px; padding: 3px 11px; border-radius: 6px; border: 1px solid transparent; background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; transition: background 0.12s, color 0.12s, border-color 0.12s; }
-  .jump-trigger svg { display: block; }
-  .jump-caret { font-size: 9px; }
-  .jump-trigger:hover, .jump-menu:focus-within .jump-trigger { color: var(--text); background: var(--raised); }
-  .jump-trigger.active { color: var(--text); border-color: var(--border); }
-  .jump-panel { position: absolute; top: calc(100% + 5px); left: 0; z-index: 50; min-width: 160px; display: none; flex-direction: column; gap: 2px; padding: 6px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.35); }
-  /* Invisible bridge over the 5px gap so the menu doesn't close as the pointer
-     travels from the trigger down to the panel. */
-  .jump-panel::before { content: ""; position: absolute; left: 0; right: 0; top: -8px; height: 8px; }
-  .jump-menu-end .jump-panel { left: auto; right: 0; }
-  .jump-menu:hover .jump-panel, .jump-menu:focus-within .jump-panel { display: flex; }
-  .jump-link { padding: 3px 11px; border-radius: 6px; border: 1px solid transparent; background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; white-space: nowrap; transition: background 0.12s, color 0.12s, border-color 0.12s; }
-  .jump-panel .jump-link { display: block; width: 100%; text-align: left; padding: 5px 10px; }
-  .jump-link:hover { color: var(--text); background: var(--raised); }
-  .jump-link.active { color: var(--text); background: var(--selected); border-color: var(--border); font-weight: 600; }
   /* Inline info affordance (e.g. the dispatches table) — native title tooltip. */
   .info-icon { display: inline-flex; align-items: center; vertical-align: middle; margin-left: 3px; color: var(--muted); cursor: help; }
   .info-icon svg { display: block; }
   .info-icon:hover { color: var(--text); }
-  /* Anchored sections clear the sticky bar when jumped/collapsed to. */
-  .stats-row, .chart-card, .table-card { scroll-margin-top: calc(var(--jump-h) + 14px); }
 
   /* Collapsible cards — a full section fold, independent of in-table Show
      more/less (which only pages rows). Collapsing hides the card body and its
@@ -520,7 +562,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .collapsed .card-caret { transform: rotate(0deg); }
   .chart-card > h2, .chart-header > h2, .section-title { cursor: pointer; user-select: none; }
   .chart-card > h2:hover, .chart-header > h2:hover, .section-title:hover { color: var(--text); }
-  .jump-link:focus-visible, .jump-trigger:focus-visible, .info-icon:focus-visible, .chart-card > h2:focus-visible, .chart-header > h2:focus-visible, .section-title:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .info-icon:focus-visible, .chart-card > h2:focus-visible, .chart-header > h2:focus-visible, .section-title:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .chart-card.collapsed > h2, .chart-card.collapsed > .chart-header { margin-bottom: 0; }
   .table-card.collapsed > .section-title, .table-card.collapsed > .section-header { margin-bottom: 0; }
   .chart-card.collapsed > *:not(h2):not(.chart-header),
@@ -561,6 +603,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="range-select">
     <select id="range-select" aria-label="Date range" onchange="setRange(this.value)">
       <option value="today">Today</option>
+      <option value="yesterday">Yesterday</option>
       <option value="week">This Week</option>
       <option value="month">This Month</option>
       <option value="prev-month">Previous Month</option>
@@ -571,37 +614,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </select>
   </div>
 </div>
-
-<nav id="jump-bar" aria-label="Jump to section">
-  <button class="jump-link" data-target="stats-row">Overview</button>
-  <div class="jump-menu">
-    <button type="button" class="jump-trigger" aria-haspopup="true" aria-expanded="false">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M8 17v-4"/><path d="M13 17V8"/><path d="M18 17v-7"/></svg>
-      Graphs <span class="jump-caret">&#9662;</span>
-    </button>
-    <div class="jump-panel">
-      <button class="jump-link" data-target="sec-daily">Daily</button>
-      <button class="jump-link" data-target="sec-hourly">Distribution</button>
-      <button class="jump-link" data-target="sec-timeline">Timeline</button>
-      <button class="jump-link" data-target="sec-models">By Model</button>
-      <button class="jump-link" data-target="sec-projects">Top Projects</button>
-      <button class="jump-link" data-target="sec-subagents">Subagents</button>
-    </div>
-  </div>
-  <div class="jump-menu jump-menu-end">
-    <button type="button" class="jump-trigger" aria-haspopup="true" aria-expanded="false">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/></svg>
-      Tables <span class="jump-caret">&#9662;</span>
-    </button>
-    <div class="jump-panel">
-      <button class="jump-link" data-target="sec-cost-model">Cost by Model</button>
-      <button class="jump-link" data-target="sec-dispatches">Dispatches</button>
-      <button class="jump-link" data-target="sec-sessions">Sessions</button>
-      <button class="jump-link" data-target="sec-cost-project">Cost by Project</button>
-      <button class="jump-link" data-target="sec-cost-branch">Cost by Project &amp; Branch</button>
-    </div>
-  </div>
-</nav>
 
 <div class="container">
   <div class="stats-row" id="stats-row"></div>
@@ -688,6 +700,38 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </table>
     <div class="table-foot" id="dispatches-foot"></div>
   </div>
+  <div class="table-card" id="sec-skill-cost" data-card="cost-by-skill">
+    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Token Usage by Skill</div><button class="export-btn" onclick="exportSkillsCSV()" title="Export all filtered skill usage to CSV">&#x2913; CSV</button></div>
+    <table>
+      <thead><tr>
+        <th>Skill</th>
+        <th class="sortable" onclick="setSkillSort('turns')">Turns <span class="sort-icon" id="sksort-turns"></span></th>
+        <th class="sortable" onclick="setSkillSort('input')">Input <span class="sort-icon" id="sksort-input"></span></th>
+        <th class="sortable" onclick="setSkillSort('output')">Output <span class="sort-icon" id="sksort-output"></span></th>
+        <th class="sortable" onclick="setSkillSort('cache_read')">Cache Read <span class="sort-icon" id="sksort-cache_read"></span></th>
+        <th class="sortable" onclick="setSkillSort('cache_creation')">Cache Creation <span class="sort-icon" id="sksort-cache_creation"></span></th>
+        <th class="sortable" onclick="setSkillSort('cost')">Est. Cost <span class="sort-icon" id="sksort-cost"></span></th>
+      </tr></thead>
+      <tbody id="skill-cost-body"></tbody>
+    </table>
+    <div class="table-foot" id="skill-cost-foot"></div>
+  </div>
+  <div class="table-card" id="sec-tool-cost" data-card="cost-by-tool">
+    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Token Usage by MCP / CLI</div><button class="export-btn" onclick="exportToolsCSV()" title="Export all filtered tool usage to CSV">&#x2913; CSV</button></div>
+    <table>
+      <thead><tr>
+        <th>Tool</th>
+        <th class="sortable" onclick="setToolSort('turns')">Turns <span class="sort-icon" id="tlsort-turns"></span></th>
+        <th class="sortable" onclick="setToolSort('input')">Input <span class="sort-icon" id="tlsort-input"></span></th>
+        <th class="sortable" onclick="setToolSort('output')">Output <span class="sort-icon" id="tlsort-output"></span></th>
+        <th class="sortable" onclick="setToolSort('cache_read')">Cache Read <span class="sort-icon" id="tlsort-cache_read"></span></th>
+        <th class="sortable" onclick="setToolSort('cache_creation')">Cache Creation <span class="sort-icon" id="tlsort-cache_creation"></span></th>
+        <th class="sortable" onclick="setToolSort('cost')">Est. Cost <span class="sort-icon" id="tlsort-cost"></span></th>
+      </tr></thead>
+      <tbody id="tool-cost-body"></tbody>
+    </table>
+    <div class="table-foot" id="tool-cost-foot"></div>
+  </div>
   <div class="table-card" id="sec-sessions" data-card="sessions">
     <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Recent Sessions</div><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div>
     <table>
@@ -721,22 +765,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <tbody id="project-cost-body"></tbody>
     </table>
     <div class="table-foot" id="project-cost-foot"></div>
-  </div>
-  <div class="table-card" id="sec-cost-branch" data-card="cost-by-branch">
-    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Cost by Project &amp; Branch</div><button class="export-btn" onclick="exportProjectBranchCSV()" title="Export project+branch breakdown to CSV">&#x2913; CSV</button></div>
-    <table>
-      <thead><tr>
-        <th>Project</th>
-        <th>Branch</th>
-        <th class="sortable" onclick="setProjectBranchSort('sessions')">Sessions <span class="sort-icon" id="pbsort-sessions"></span></th>
-        <th class="sortable" onclick="setProjectBranchSort('turns')">Turns <span class="sort-icon" id="pbsort-turns"></span></th>
-        <th class="sortable" onclick="setProjectBranchSort('input')">Input <span class="sort-icon" id="pbsort-input"></span></th>
-        <th class="sortable" onclick="setProjectBranchSort('output')">Output <span class="sort-icon" id="pbsort-output"></span></th>
-        <th class="sortable" onclick="setProjectBranchSort('cost')">Est. Cost <span class="sort-icon" id="pbsort-cost"></span></th>
-      </tr></thead>
-      <tbody id="project-branch-cost-body"></tbody>
-    </table>
-    <div class="table-foot" id="project-branch-cost-foot"></div>
   </div>
 </div>
 
@@ -773,12 +801,15 @@ let modelSortCol = 'cost';
 let modelSortDir = 'desc';
 let projectSortCol = 'cost';
 let projectSortDir = 'desc';
-let branchSortCol = 'cost';
-let branchSortDir = 'desc';
+let skillSortCol = 'cost';
+let skillSortDir = 'desc';
+let toolSortCol = 'cost';
+let toolSortDir = 'desc';
 let lastFilteredSessions = [];
 let lastByModel = [];
 let lastByProject = [];
-let lastByProjectBranch = [];
+let lastBySkill = [];
+let lastByTool = [];
 let lastFilteredDispatches = [];
 let sessionSortDir = 'desc';
 
@@ -808,7 +839,8 @@ function shownCount(limit, total) {
 let modelLimit = TABLE_STEPS[0];
 let sessionsLimit = TABLE_STEPS[0];
 let projectLimit = TABLE_STEPS[0];
-let branchLimit = TABLE_STEPS[0];
+let skillLimit = TABLE_STEPS[0];
+let toolLimit = TABLE_STEPS[0];
 let dispatchesLimit = TABLE_STEPS[0];
 let hourlyTZ = 'local';  // 'local' or 'utc'
 
@@ -1001,8 +1033,8 @@ function legendToggle(key) {
 }
 
 // ── Time range ─────────────────────────────────────────────────────────────
-const RANGE_LABELS = { 'today': 'Today', 'week': 'This Week', 'month': 'This Month', 'prev-month': 'Previous Month', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
-const RANGE_TICKS  = { 'today': 1, 'week': 7, 'month': 15, 'prev-month': 15, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
+const RANGE_LABELS = { 'today': 'Today', 'yesterday': 'Yesterday', 'week': 'This Week', 'month': 'This Month', 'prev-month': 'Previous Month', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
+const RANGE_TICKS  = { 'today': 1, 'yesterday': 1, 'week': 7, 'month': 15, 'prev-month': 15, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
 const VALID_RANGES = Object.keys(RANGE_LABELS);
 
 function rangeIncludesToday(range) {
@@ -1020,6 +1052,11 @@ function getRangeBounds(range) {
   const iso = d => d.toISOString().slice(0, 10);
   if (range === 'today') {
     const t = iso(today);
+    return { start: t, end: t };
+  }
+  if (range === 'yesterday') {
+    const y = new Date(today); y.setDate(today.getDate() - 1);
+    const t = iso(y);
     return { start: t, end: t };
   }
   if (range === 'week') {
@@ -1067,15 +1104,41 @@ function setRange(range) {
 let timelineGranularity = 'hour';
 let timelineRawRows = [];
 
-function timelineRangeSpanDays() {
-  const { start, end } = getRangeBounds(selectedRange);
-  if (!start || !end) return null;  // unbounded range (All Time, or open-ended Nd ranges)
-  return (new Date(end) - new Date(start)) / 86400000;
+function timelineMinuteAllowed() {
+  return selectedRange === 'today' || selectedRange === 'yesterday';
 }
 
-function timelineMinuteAllowed() {
-  const span = timelineRangeSpanDays();
-  return span !== null && span <= 7;
+// Advance a plain 'YYYY-MM-DD' string by `delta` days, anchored in UTC so the
+// calendar walk never shifts a day under a local-timezone DST transition.
+function addDaysISO(dateStr, delta) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + delta);
+  return dt.toISOString().slice(0, 10);
+}
+
+// Every hour/minute bucket the chart should show, including ones with no
+// data (so the axis reads as a continuous timeline, not just the moments
+// something happened). Returns null for an unbounded range (All Time, or the
+// open-ended Nd ranges with no end) — there's no fixed extent to fill, so the
+// caller falls back to whatever buckets the data actually has.
+function timelineExpectedBuckets(start, end, granularity) {
+  if (!start && !end) return null;
+  const startDate = start || end;
+  const endDate = end || new Date().toISOString().slice(0, 10);
+  const buckets = [];
+  let d = startDate;
+  for (let i = 0; i < 366 && d <= endDate; i++) {  // bounded walk, defensive against a bad range
+    for (let h = 0; h < 24; h++) {
+      if (granularity === 'hour') {
+        buckets.push(d + ' ' + String(h).padStart(2, '0') + ':00');
+      } else {
+        for (let m = 0; m < 60; m++) buckets.push(d + ' ' + String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0'));
+      }
+    }
+    d = addDaysISO(d, 1);
+  }
+  return buckets;
 }
 
 function setTimelineGranularity(g) {
@@ -1155,7 +1218,9 @@ function renderTimelineChart(rows) {
   const hasOther = Object.keys(projTotals).length > topProjects.length;
   const labels = hasOther ? [...topProjects, 'Other'] : topProjects;
 
-  const buckets = [...new Set(rows.map(r => r.bucket))].sort();
+  const { start, end } = getRangeBounds(selectedRange);
+  const buckets = timelineExpectedBuckets(start, end, timelineGranularity)
+    || [...new Set(rows.map(r => r.bucket))].sort();
   timelineBuckets = buckets;
   const bucketIndex = new Map(buckets.map((b, i) => [b, i]));
   const seriesMap = {};
@@ -1543,21 +1608,40 @@ function applyFilter() {
   }
   const byProject = Object.values(projMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
-  // By project+branch: aggregate from filtered sessions
-  const projBranchMap = {};
-  for (const s of filteredSessions) {
-    const key = s.project + '\x00' + (s.branch || '');
-    if (!projBranchMap[key]) projBranchMap[key] = { project: s.project, branch: s.branch || '', input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0, cost: 0 };
-    const pb = projBranchMap[key];
-    pb.input          += s.input;
-    pb.output         += s.output;
-    pb.cache_read     += s.cache_read;
-    pb.cache_creation += s.cache_creation;
-    pb.turns          += s.turns;
-    pb.sessions++;
-    pb.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+  // By skill (filtered by range + selected models). Cost is summed per source
+  // row (day+skill+model) rather than computed once on the aggregate, since a
+  // skill can be invoked under different models with different pricing.
+  const skillMap = {};
+  for (const r of (rawData.skill_by_day || [])) {
+    if (!selectedModels.has(r.model)) continue;
+    if (start && r.day < start) continue;
+    if (end && r.day > end) continue;
+    const k = r.skill;
+    if (!skillMap[k]) skillMap[k] = { skill: k, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, cost: 0 };
+    const m = skillMap[k];
+    m.input += r.input; m.output += r.output;
+    m.cache_read += r.cache_read; m.cache_creation += r.cache_creation;
+    m.turns += r.turns;
+    m.cost += calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation);
   }
-  const byProjectBranch = Object.values(projBranchMap).sort((a, b) => b.cost - a.cost);
+  const bySkill = Object.values(skillMap).sort((a, b) => b.cost - a.cost);
+
+  // By tool, MCP servers collapsed to "MCP: <server>" (see toolGroupLabel).
+  // Same per-row cost summing as bySkill above, for the same reason.
+  const toolMap = {};
+  for (const r of (rawData.tool_by_day || [])) {
+    if (!selectedModels.has(r.model)) continue;
+    if (start && r.day < start) continue;
+    if (end && r.day > end) continue;
+    const k = toolGroupLabel(r.tool_name);
+    if (!toolMap[k]) toolMap[k] = { tool: k, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, cost: 0 };
+    const m = toolMap[k];
+    m.input += r.input; m.output += r.output;
+    m.cache_read += r.cache_read; m.cache_creation += r.cache_creation;
+    m.turns += r.turns;
+    m.cost += calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation);
+  }
+  const byTool = Object.values(toolMap).sort((a, b) => b.cost - a.cost);
 
   // Totals
   const totals = {
@@ -1620,11 +1704,13 @@ function applyFilter() {
   lastFilteredSessions = sortSessions(filteredSessions);
   lastByModel = byModel;
   lastByProject = sortProjects(byProject);
-  lastByProjectBranch = sortProjectBranch(byProjectBranch);
+  lastBySkill = sortSkills(bySkill);
+  lastByTool = sortTools(byTool);
   renderSessionsTable(lastFilteredSessions);
   renderModelCostTable(lastByModel);
   renderProjectCostTable(lastByProject);
-  renderProjectBranchCostTable(lastByProjectBranch);
+  renderSkillCostTable(lastBySkill);
+  renderToolCostTable(lastByTool);
 }
 
 // ── Renderers ──────────────────────────────────────────────────────────────
@@ -1953,8 +2039,10 @@ function moreSessionRows() { sessionsLimit = nextTableLimit(sessionsLimit, lastF
 function lessSessionRows() { sessionsLimit = TABLE_STEPS[0]; renderSessionsTable(lastFilteredSessions);    scrollTableToTop('sessions-body'); }
 function moreProjectRows() { projectLimit  = nextTableLimit(projectLimit,  lastByProject.length);       renderProjectCostTable(lastByProject); }
 function lessProjectRows() { projectLimit  = TABLE_STEPS[0]; renderProjectCostTable(lastByProject);        scrollTableToTop('project-cost-body'); }
-function moreBranchRows()  { branchLimit   = nextTableLimit(branchLimit,   lastByProjectBranch.length); renderProjectBranchCostTable(lastByProjectBranch); }
-function lessBranchRows()  { branchLimit   = TABLE_STEPS[0]; renderProjectBranchCostTable(lastByProjectBranch); scrollTableToTop('project-branch-cost-body'); }
+function moreSkillRows()   { skillLimit    = nextTableLimit(skillLimit,    lastBySkill.length);        renderSkillCostTable(lastBySkill); }
+function lessSkillRows()   { skillLimit    = TABLE_STEPS[0]; renderSkillCostTable(lastBySkill);            scrollTableToTop('skill-cost-body'); }
+function moreToolRows()    { toolLimit     = nextTableLimit(toolLimit,     lastByTool.length);         renderToolCostTable(lastByTool); }
+function lessToolRows()    { toolLimit     = TABLE_STEPS[0]; renderToolCostTable(lastByTool);              scrollTableToTop('tool-cost-body'); }
 function moreDispatchRows(){ dispatchesLimit = nextTableLimit(dispatchesLimit, lastFilteredDispatches.length); renderTopDispatches(lastFilteredDispatches); }
 function lessDispatchRows(){ dispatchesLimit = TABLE_STEPS[0]; renderTopDispatches(lastFilteredDispatches);            scrollTableToTop('dispatches-body'); }
 
@@ -2082,55 +2170,107 @@ function renderProjectCostTable(byProject) {
   renderTableToggle('project-cost-foot', sorted.length, projectLimit, 'lessProjectRows', 'moreProjectRows', 'exportProjectsCSV');
 }
 
-// ── Project+Branch cost table sorting ────────────────────────────────────
-function setProjectBranchSort(col) {
-  if (branchSortCol === col) {
-    branchSortDir = branchSortDir === 'desc' ? 'asc' : 'desc';
+// ── Skill cost table sorting ─────────────────────────────
+function setSkillSort(col) {
+  if (skillSortCol === col) {
+    skillSortDir = skillSortDir === 'desc' ? 'asc' : 'desc';
   } else {
-    branchSortCol = col;
-    branchSortDir = 'desc';
+    skillSortCol = col;
+    skillSortDir = 'desc';
   }
-  updateProjectBranchSortIcons();
+  updateSkillSortIcons();
   applyFilter();
 }
 
-function updateProjectBranchSortIcons() {
-  document.querySelectorAll('[id^="pbsort-"]').forEach(el => el.textContent = '');
-  const icon = document.getElementById('pbsort-' + branchSortCol);
-  if (icon) icon.textContent = branchSortDir === 'desc' ? ' \u25bc' : ' \u25b2';
+function updateSkillSortIcons() {
+  document.querySelectorAll('[id^="sksort-"]').forEach(el => el.textContent = '');
+  const icon = document.getElementById('sksort-' + skillSortCol);
+  if (icon) icon.textContent = skillSortDir === 'desc' ? ' ▼' : ' ▲';
 }
 
-function sortProjectBranch(rows) {
-  // Sort by the selected column (default: cost desc), consistent with the Cost by
-  // Model / Cost by Project tables. Project name is only a stable tiebreaker when
-  // the sorted column ties, so a project's branches stay grouped & deterministic
-  // without overriding the primary order.
+function sortSkills(rows) {
   return [...rows].sort((a, b) => {
-    const av = a[branchSortCol] ?? 0;
-    const bv = b[branchSortCol] ?? 0;
-    if (av < bv) return branchSortDir === 'desc' ? 1 : -1;
-    if (av > bv) return branchSortDir === 'desc' ? -1 : 1;
-    const pa = (a.project || '').toLowerCase();
-    const pb = (b.project || '').toLowerCase();
-    return pa < pb ? -1 : pa > pb ? 1 : 0;
+    const av = a[skillSortCol] ?? 0;
+    const bv = b[skillSortCol] ?? 0;
+    if (av < bv) return skillSortDir === 'desc' ? 1 : -1;
+    if (av > bv) return skillSortDir === 'desc' ? -1 : 1;
+    return 0;
   });
 }
 
-function renderProjectBranchCostTable(rows) {
-  const sorted = sortProjectBranch(rows);
-  const shown = sorted.slice(0, shownCount(branchLimit, sorted.length));
-  document.getElementById('project-branch-cost-body').innerHTML = shown.map(pb => {
+function renderSkillCostTable(rows) {
+  const sorted = sortSkills(rows);
+  const shown = sorted.slice(0, shownCount(skillLimit, sorted.length));
+  document.getElementById('skill-cost-body').innerHTML = shown.length ? shown.map(sk => {
     return `<tr>
-      <td>${esc(pb.project)}</td>
-      <td class="muted" style="font-family:monospace">${esc(pb.branch || '\u2014')}</td>
-      <td class="num">${pb.sessions}</td>
-      <td class="num">${fmt(pb.turns)}</td>
-      <td class="num">${fmt(pb.input)}</td>
-      <td class="num">${fmt(pb.output)}</td>
-      <td class="cost">${fmtCost(pb.cost)}</td>
+      <td>${esc(sk.skill)}</td>
+      <td class="num">${fmt(sk.turns)}</td>
+      <td class="num">${fmt(sk.input)}</td>
+      <td class="num">${fmt(sk.output)}</td>
+      <td class="num">${fmt(sk.cache_read)}</td>
+      <td class="num">${fmt(sk.cache_creation)}</td>
+      <td class="cost">${fmtCost(sk.cost)}</td>
     </tr>`;
-  }).join('');
-  renderTableToggle('project-branch-cost-foot', sorted.length, branchLimit, 'lessBranchRows', 'moreBranchRows', 'exportProjectBranchCSV');
+  }).join('') : '<tr><td colspan="7" class="muted">No skill invocations in range.</td></tr>';
+  renderTableToggle('skill-cost-foot', sorted.length, skillLimit, 'lessSkillRows', 'moreSkillRows', 'exportSkillsCSV');
+}
+
+// ── Tool (MCP / CLI) cost table sorting ───────────────────────
+// mcp__<server>__<tool> collapses to "MCP: <server>"; everything else (Bash,
+// Read, Edit, Skill, ...) is shown as its own tool name. Tolerates a server
+// name that itself contains "__" by treating everything between the first
+// and last segment as the server.
+function toolGroupLabel(toolName) {
+  if (!toolName) return 'unknown';
+  if (toolName.startsWith('mcp__')) {
+    const parts = toolName.split('__');
+    return parts.length >= 3 ? 'MCP: ' + parts.slice(1, -1).join('__') : 'MCP: unknown';
+  }
+  return toolName;
+}
+
+function setToolSort(col) {
+  if (toolSortCol === col) {
+    toolSortDir = toolSortDir === 'desc' ? 'asc' : 'desc';
+  } else {
+    toolSortCol = col;
+    toolSortDir = 'desc';
+  }
+  updateToolSortIcons();
+  applyFilter();
+}
+
+function updateToolSortIcons() {
+  document.querySelectorAll('[id^="tlsort-"]').forEach(el => el.textContent = '');
+  const icon = document.getElementById('tlsort-' + toolSortCol);
+  if (icon) icon.textContent = toolSortDir === 'desc' ? ' ▼' : ' ▲';
+}
+
+function sortTools(rows) {
+  return [...rows].sort((a, b) => {
+    const av = a[toolSortCol] ?? 0;
+    const bv = b[toolSortCol] ?? 0;
+    if (av < bv) return toolSortDir === 'desc' ? 1 : -1;
+    if (av > bv) return toolSortDir === 'desc' ? -1 : 1;
+    return 0;
+  });
+}
+
+function renderToolCostTable(rows) {
+  const sorted = sortTools(rows);
+  const shown = sorted.slice(0, shownCount(toolLimit, sorted.length));
+  document.getElementById('tool-cost-body').innerHTML = shown.length ? shown.map(t => {
+    return `<tr>
+      <td>${esc(t.tool)}</td>
+      <td class="num">${fmt(t.turns)}</td>
+      <td class="num">${fmt(t.input)}</td>
+      <td class="num">${fmt(t.output)}</td>
+      <td class="num">${fmt(t.cache_read)}</td>
+      <td class="num">${fmt(t.cache_creation)}</td>
+      <td class="cost">${fmtCost(t.cost)}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="7" class="muted">No tool usage in range.</td></tr>';
+  renderTableToggle('tool-cost-foot', sorted.length, toolLimit, 'lessToolRows', 'moreToolRows', 'exportToolsCSV');
 }
 
 // ── CSV Export ────────────────────────────────────────────────────────────
@@ -2187,12 +2327,20 @@ function exportProjectsCSV() {
   downloadCSV('projects', header, rows);
 }
 
-function exportProjectBranchCSV() {
-  const header = ['Project', 'Branch', 'Sessions', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
-  const rows = lastByProjectBranch.map(pb => {
-    return [pb.project, pb.branch, pb.sessions, pb.turns, pb.input, pb.output, pb.cache_read, pb.cache_creation, pb.cost.toFixed(4)];
+function exportSkillsCSV() {
+  const header = ['Skill', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
+  const rows = lastBySkill.map(sk => {
+    return [sk.skill, sk.turns, sk.input, sk.output, sk.cache_read, sk.cache_creation, sk.cost.toFixed(4)];
   });
-  downloadCSV('projects_by_branch', header, rows);
+  downloadCSV('skills', header, rows);
+}
+
+function exportToolsCSV() {
+  const header = ['Tool', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
+  const rows = lastByTool.map(t => {
+    return [t.tool, t.turns, t.input, t.output, t.cache_read, t.cache_creation, t.cost.toFixed(4)];
+  });
+  downloadCSV('tools', header, rows);
 }
 
 function exportDispatchesCSV() {
@@ -2259,7 +2407,8 @@ async function loadData() {
       updateSortIcons();
       updateModelSortIcons();
       updateProjectSortIcons();
-      updateProjectBranchSortIcons();
+      updateSkillSortIcons();
+      updateToolSortIcons();
       fetchTimeline();
     }
 
@@ -2352,13 +2501,11 @@ function initFooterMeta() {
   if (v && APP_CONFIG.surface !== 'vscode') checkForUpdate(v);
 }
 
-// ── Section nav + collapsible cards ─────────────────────────────────────────
-// The dashboard is one long scroll. The sticky jump bar teleports between
-// sections; collapsible cards fold away the ones you don't use. Collapse state
-// persists per card in localStorage and is independent of in-table Show
-// more/less (which only pages rows within a single table).
+// ── Collapsible cards ────────────────────────────────────────────────────────
+// Collapsible cards fold away sections you don't use. Collapse state persists
+// per card in localStorage and is independent of in-table Show more/less
+// (which only pages rows within a single table).
 const COLLAPSE_KEY = 'cu_collapsed_cards';
-const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 function loadCollapsedSet() {
   try { return new Set(JSON.parse(localStorage.getItem(COLLAPSE_KEY) || '[]')); }
@@ -2392,25 +2539,9 @@ function toggleCard(card) {
   if (!collapsed) requestAnimationFrame(() => resizeChartsIn(card));
 }
 
-function jumpToSection(id) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  if (el.dataset.card && el.classList.contains('collapsed')) toggleCard(el);  // expand before scrolling
-  el.scrollIntoView({ behavior: prefersReducedMotion ? 'auto' : 'smooth', block: 'start' });
-}
-
-function initSectionNav() {
-  const bar = document.getElementById('jump-bar');
+function initCollapsibleCards() {
   const container = document.querySelector('.container');
   if (!container) return;
-
-  // Keep --jump-h synced to the bar's real height so scroll-margin clears it
-  // even when the links wrap to a second row on a narrow panel.
-  const syncJumpHeight = () => {
-    if (bar) document.documentElement.style.setProperty('--jump-h', bar.offsetHeight + 'px');
-  };
-  syncJumpHeight();
-  window.addEventListener('resize', syncJumpHeight);
 
   // Restore persisted collapse state + make each title an accessible toggle.
   const collapsed = loadCollapsedSet();
@@ -2436,61 +2567,10 @@ function initSectionNav() {
   };
   container.addEventListener('click', onTitleActivate);
   container.addEventListener('keydown', onTitleActivate);
-
-  // Jump links teleport to a section (expanding it first if collapsed). Blur the
-  // clicked item so the hover/focus dropdown it lives in closes after the jump.
-  if (bar) bar.addEventListener('click', (e) => {
-    const link = e.target.closest('.jump-link');
-    if (link) { jumpToSection(link.dataset.target); link.blur(); }
-  });
-
-  // Mirror open/closed state on the menu triggers for assistive tech, and let
-  // Escape close an open menu.
-  document.querySelectorAll('.jump-menu').forEach(menu => {
-    const trig = menu.querySelector('.jump-trigger');
-    const sync = (open) => { if (trig) trig.setAttribute('aria-expanded', String(open)); };
-    // A mouse click must not focus (and thus pin) the trigger — otherwise the
-    // panel stays open after the pointer leaves and fights the next hover. Tab
-    // focus still works (it doesn't go through mousedown), keeping it keyboard-open.
-    if (trig) trig.addEventListener('mousedown', (e) => e.preventDefault());
-    menu.addEventListener('mouseenter', () => sync(true));
-    menu.addEventListener('mouseleave', () => sync(false));
-    menu.addEventListener('focusin', () => sync(true));
-    menu.addEventListener('focusout', () => sync(false));
-    menu.addEventListener('keydown', (e) => { if (e.key === 'Escape' && document.activeElement) document.activeElement.blur(); });
-  });
-
-  // Scroll-spy: highlight the link for the topmost section under the bar, and
-  // mark the parent Graphs/Tables trigger so the closed menu shows where you are.
-  const links = [...document.querySelectorAll('.jump-link')];
-  const menus = [...document.querySelectorAll('.jump-menu')];
-  const targets = links.map(l => document.getElementById(l.dataset.target)).filter(Boolean)
-    .sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1);
-  let spyScheduled = false;
-  const updateActive = () => {
-    spyScheduled = false;
-    const line = (bar ? bar.offsetHeight : 45) + 16;
-    let activeId = targets.length ? targets[0].id : null;
-    for (const t of targets) {
-      if (t.getBoundingClientRect().top - line <= 1) activeId = t.id; else break;
-    }
-    // At the very bottom the last (often short) section may never reach the line.
-    if (targets.length && (window.innerHeight + window.scrollY) >= document.body.scrollHeight - 4)
-      activeId = targets[targets.length - 1].id;
-    links.forEach(l => l.classList.toggle('active', l.dataset.target === activeId));
-    menus.forEach(menu => {
-      const trig = menu.querySelector('.jump-trigger');
-      if (trig) trig.classList.toggle('active', !!menu.querySelector('.jump-link.active'));
-    });
-  };
-  window.addEventListener('scroll', () => {
-    if (!spyScheduled) { spyScheduled = true; requestAnimationFrame(updateActive); }
-  }, { passive: true });
-  updateActive();
 }
 
 initFooterMeta();
-initSectionNav();
+initCollapsibleCards();
 loadData();
 scheduleAutoRefresh();
 </script>

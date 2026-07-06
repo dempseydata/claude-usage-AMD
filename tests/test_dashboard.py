@@ -127,6 +127,84 @@ class TestGetDashboardData(unittest.TestCase):
         self.assertTrue(all(r["day"] == "2026-04-08" for r in rows))
 
 
+class TestSkillAndToolUsage(unittest.TestCase):
+    """Tests for skill_by_day / tool_by_day — the Token Usage by Skill and
+    Token Usage by MCP / CLI tables."""
+
+    def setUp(self):
+        self.tmpfile = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmpfile.close()
+        self.db_path = Path(self.tmpfile.name)
+        conn = get_db(self.db_path)
+        init_db(conn)
+        upsert_sessions(conn, [{
+            "session_id": "sess-abc123", "project_name": "user/myproject",
+            "first_timestamp": "2026-04-08T09:00:00Z",
+            "last_timestamp": "2026-04-08T10:00:00Z",
+            "git_branch": "main", "model": "claude-sonnet-4-6",
+            "total_input_tokens": 5000, "total_output_tokens": 2000,
+            "total_cache_read": 500, "total_cache_creation": 200,
+            "turn_count": 10,
+        }])
+        insert_turns(conn, [
+            {
+                "session_id": "sess-abc123", "timestamp": "2026-04-08T09:30:00Z",
+                "model": "claude-sonnet-4-6", "input_tokens": 500,
+                "output_tokens": 200, "cache_read_tokens": 50,
+                "cache_creation_tokens": 20, "tool_name": "Skill",
+                "skill_name": "career-ops", "cwd": "/tmp",
+            },
+            {
+                "session_id": "sess-abc123", "timestamp": "2026-04-08T09:31:00Z",
+                "model": "claude-sonnet-4-6", "input_tokens": 300,
+                "output_tokens": 150, "cache_read_tokens": 0,
+                "cache_creation_tokens": 0, "tool_name": "Bash",
+                "skill_name": None, "cwd": "/tmp",
+            },
+            {
+                "session_id": "sess-abc123", "timestamp": "2026-04-08T09:32:00Z",
+                "model": "claude-sonnet-4-6", "input_tokens": 100,
+                "output_tokens": 50, "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "tool_name": "mcp__plugin_playwright_playwright__browser_click",
+                "skill_name": None, "cwd": "/tmp",
+            },
+        ])
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    def test_skill_by_day_only_includes_skill_turns(self):
+        data = get_dashboard_data(db_path=self.db_path)
+        skills = {r["skill"] for r in data["skill_by_day"]}
+        self.assertEqual(skills, {"career-ops"})
+
+    def test_skill_by_day_carries_tokens(self):
+        data = get_dashboard_data(db_path=self.db_path)
+        row = data["skill_by_day"][0]
+        self.assertEqual(row["input"], 500)
+        self.assertEqual(row["output"], 200)
+        self.assertEqual(row["turns"], 1)
+
+    def test_tool_by_day_includes_raw_tool_names(self):
+        data = get_dashboard_data(db_path=self.db_path)
+        tool_names = {r["tool_name"] for r in data["tool_by_day"]}
+        self.assertEqual(
+            tool_names,
+            {"Skill", "Bash", "mcp__plugin_playwright_playwright__browser_click"},
+        )
+
+    def test_tool_by_day_does_not_collapse_mcp_names(self):
+        # Grouping "mcp__server__tool" down to its server happens client-side
+        # (toolGroupLabel in JS) — the server ships the raw tool_name.
+        data = get_dashboard_data(db_path=self.db_path)
+        mcp_row = next(r for r in data["tool_by_day"]
+                        if r["tool_name"] == "mcp__plugin_playwright_playwright__browser_click")
+        self.assertEqual(mcp_row["input"], 100)
+
+
 class TestGetTimelineData(unittest.TestCase):
     """Tests for the Usage Timeline chart's project-grouped minute/hour buckets."""
 

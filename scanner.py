@@ -123,6 +123,10 @@ def init_db(conn):
     # column-add event), so it also covers DBs that gained the column from an
     # earlier build that predated the backfill.
     _ensure_column(conn, "sessions", "topic", "TEXT")
+    # Skill name for tool_name='Skill' turns (the Skill tool's own "skill"
+    # input param), so the dashboard can break down usage per skill rather
+    # than lumping every skill invocation under the generic "Skill" tool name.
+    _ensure_column(conn, "turns", "skill_name", "TEXT")
     # Conditional unique index: only dedup non-null message IDs
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message_id
@@ -411,11 +415,15 @@ def parse_jsonl_file(filepath):
                     if input_tokens + output_tokens + cache_read + cache_creation == 0:
                         continue
 
-                    # Extract tool name from content if present
+                    # Extract tool name (and, for the Skill tool, which skill
+                    # was invoked) from content if present
                     tool_name = None
+                    skill_name = None
                     for item in msg.get("content", []):
                         if isinstance(item, dict) and item.get("type") == "tool_use":
                             tool_name = item.get("name")
+                            if tool_name == "Skill":
+                                skill_name = (item.get("input") or {}).get("skill")
                             break
 
                     if model:
@@ -430,6 +438,7 @@ def parse_jsonl_file(filepath):
                         "cache_read_tokens": cache_read,
                         "cache_creation_tokens": cache_creation,
                         "tool_name": tool_name,
+                        "skill_name": skill_name,
                         "cwd": cwd,
                         "message_id": message_id,
                         "is_subagent": 1 if is_subagent_record(record, filepath) else 0,
@@ -560,14 +569,14 @@ def insert_turns(conn, turns):
     conn.executemany("""
         INSERT OR IGNORE INTO turns
             (session_id, timestamp, model, input_tokens, output_tokens,
-             cache_read_tokens, cache_creation_tokens, tool_name, cwd, message_id,
+             cache_read_tokens, cache_creation_tokens, tool_name, skill_name, cwd, message_id,
              is_subagent, agent_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [
         (t["session_id"], t["timestamp"], t["model"],
          t["input_tokens"], t["output_tokens"],
          t["cache_read_tokens"], t["cache_creation_tokens"],
-         t["tool_name"], t["cwd"], t.get("message_id", ""),
+         t["tool_name"], t.get("skill_name"), t["cwd"], t.get("message_id", ""),
          t.get("is_subagent", 0), t.get("agent_id"))
         for t in turns
     ])
@@ -737,9 +746,12 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                                 continue
 
                             tool_name = None
+                            skill_name = None
                             for item in msg.get("content", []):
                                 if isinstance(item, dict) and item.get("type") == "tool_use":
                                     tool_name = item.get("name")
+                                    if tool_name == "Skill":
+                                        skill_name = (item.get("input") or {}).get("skill")
                                     break
 
                             if model:
@@ -754,6 +766,7 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                                 "cache_read_tokens": cache_read,
                                 "cache_creation_tokens": cache_creation,
                                 "tool_name": tool_name,
+                                "skill_name": skill_name,
                                 "cwd": cwd,
                                 "message_id": message_id,
                                 "is_subagent": 1 if is_subagent_record(record, filepath) else 0,

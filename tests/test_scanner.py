@@ -193,6 +193,44 @@ class TestParseJsonlFile(unittest.TestCase):
         _, turns, _, _ = parse_jsonl_file(path)
         self.assertEqual(turns[0]["tool_name"], "Read")
 
+    def test_skill_name_extracted_from_skill_tool(self):
+        record = json.dumps({
+            "type": "assistant",
+            "sessionId": "s1",
+            "timestamp": "2026-04-08T10:00:00Z",
+            "cwd": "/tmp",
+            "message": {
+                "model": "claude-sonnet-4-6",
+                "usage": {"input_tokens": 100, "output_tokens": 50,
+                          "cache_read_input_tokens": 0,
+                          "cache_creation_input_tokens": 0},
+                "content": [{"type": "tool_use", "name": "Skill",
+                             "input": {"skill": "career-ops", "args": ""}}],
+            },
+        })
+        path = self._write_jsonl("test.jsonl", [record])
+        _, turns, _, _ = parse_jsonl_file(path)
+        self.assertEqual(turns[0]["tool_name"], "Skill")
+        self.assertEqual(turns[0]["skill_name"], "career-ops")
+
+    def test_skill_name_none_for_non_skill_tools(self):
+        record = json.dumps({
+            "type": "assistant",
+            "sessionId": "s1",
+            "timestamp": "2026-04-08T10:00:00Z",
+            "cwd": "/tmp",
+            "message": {
+                "model": "claude-sonnet-4-6",
+                "usage": {"input_tokens": 100, "output_tokens": 50,
+                          "cache_read_input_tokens": 0,
+                          "cache_creation_input_tokens": 0},
+                "content": [{"type": "tool_use", "name": "Bash"}],
+            },
+        })
+        path = self._write_jsonl("test.jsonl", [record])
+        _, turns, _, _ = parse_jsonl_file(path)
+        self.assertIsNone(turns[0]["skill_name"])
+
 
 class TestMessageIdDedup(unittest.TestCase):
     """Test deduplication of streaming events by message.id."""
