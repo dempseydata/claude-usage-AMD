@@ -27,6 +27,24 @@ DEFAULT_PROJECTS_DIRS = [PROJECTS_DIR, XCODE_PROJECTS_DIR]
 MODEL_PRIORITY = {"fable": 5, "mythos": 5, "opus": 3, "sonnet": 2, "haiku": 1}
 
 
+def _extract_cli_name(command):
+    """First executable name in a Bash command, so "Token Usage by MCP / CLI"
+    can show "playwright-cli" instead of a generic "Bash" bucket. Takes the
+    last '&&' segment first, so a leading "cd foo &&" doesn't mask the actual
+    command that ran.
+
+    # ponytail: not a real shell tokenizer — splits only on '&&', not ';'/'|',
+    # because those characters show up constantly inside quoted grep/sed/awk
+    # patterns and would misparse the command. '&&' has the same (smaller)
+    # risk but is worth it for the common "cd x && real-command" idiom.
+    """
+    if not command:
+        return None
+    last = command.split("&&")[-1].strip()
+    tokens = last.split()
+    return tokens[0] if tokens else None
+
+
 def _model_priority(model):
     """Return a priority score for a model name (higher = more capable)."""
     if not model:
@@ -127,6 +145,10 @@ def init_db(conn):
     # input param), so the dashboard can break down usage per skill rather
     # than lumping every skill invocation under the generic "Skill" tool name.
     _ensure_column(conn, "turns", "skill_name", "TEXT")
+    # First executable name for tool_name='Bash' turns, so the dashboard can
+    # tell "playwright-cli" apart from every other Bash invocation instead of
+    # lumping them all under a generic "Bash" bucket.
+    _ensure_column(conn, "turns", "cli_name", "TEXT")
     # Conditional unique index: only dedup non-null message IDs
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message_id
@@ -415,15 +437,18 @@ def parse_jsonl_file(filepath):
                     if input_tokens + output_tokens + cache_read + cache_creation == 0:
                         continue
 
-                    # Extract tool name (and, for the Skill tool, which skill
-                    # was invoked) from content if present
+                    # Extract tool name (and, for the Skill/Bash tools, which
+                    # skill/CLI was invoked) from content if present
                     tool_name = None
                     skill_name = None
+                    cli_name = None
                     for item in msg.get("content", []):
                         if isinstance(item, dict) and item.get("type") == "tool_use":
                             tool_name = item.get("name")
                             if tool_name == "Skill":
                                 skill_name = (item.get("input") or {}).get("skill")
+                            elif tool_name == "Bash":
+                                cli_name = _extract_cli_name((item.get("input") or {}).get("command"))
                             break
 
                     if model:
@@ -439,6 +464,7 @@ def parse_jsonl_file(filepath):
                         "cache_creation_tokens": cache_creation,
                         "tool_name": tool_name,
                         "skill_name": skill_name,
+                        "cli_name": cli_name,
                         "cwd": cwd,
                         "message_id": message_id,
                         "is_subagent": 1 if is_subagent_record(record, filepath) else 0,
@@ -569,14 +595,14 @@ def insert_turns(conn, turns):
     conn.executemany("""
         INSERT OR IGNORE INTO turns
             (session_id, timestamp, model, input_tokens, output_tokens,
-             cache_read_tokens, cache_creation_tokens, tool_name, skill_name, cwd, message_id,
+             cache_read_tokens, cache_creation_tokens, tool_name, skill_name, cli_name, cwd, message_id,
              is_subagent, agent_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [
         (t["session_id"], t["timestamp"], t["model"],
          t["input_tokens"], t["output_tokens"],
          t["cache_read_tokens"], t["cache_creation_tokens"],
-         t["tool_name"], t.get("skill_name"), t["cwd"], t.get("message_id", ""),
+         t["tool_name"], t.get("skill_name"), t.get("cli_name"), t["cwd"], t.get("message_id", ""),
          t.get("is_subagent", 0), t.get("agent_id"))
         for t in turns
     ])
@@ -747,11 +773,14 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
 
                             tool_name = None
                             skill_name = None
+                            cli_name = None
                             for item in msg.get("content", []):
                                 if isinstance(item, dict) and item.get("type") == "tool_use":
                                     tool_name = item.get("name")
                                     if tool_name == "Skill":
                                         skill_name = (item.get("input") or {}).get("skill")
+                                    elif tool_name == "Bash":
+                                        cli_name = _extract_cli_name((item.get("input") or {}).get("command"))
                                     break
 
                             if model:
@@ -767,6 +796,7 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                                 "cache_creation_tokens": cache_creation,
                                 "tool_name": tool_name,
                                 "skill_name": skill_name,
+                                "cli_name": cli_name,
                                 "cwd": cwd,
                                 "message_id": message_id,
                                 "is_subagent": 1 if is_subagent_record(record, filepath) else 0,

@@ -10,8 +10,30 @@ from pathlib import Path
 from scanner import (
     get_db, init_db, project_name_from_cwd, parse_jsonl_file,
     aggregate_sessions, upsert_sessions, insert_turns, scan,
-    _backfill_topics, _meta_get, _meta_set,
+    _backfill_topics, _meta_get, _meta_set, _extract_cli_name,
 )
+
+
+class TestExtractCliName(unittest.TestCase):
+    def test_simple_command(self):
+        self.assertEqual(_extract_cli_name("playwright-cli goto https://x.com"), "playwright-cli")
+
+    def test_cd_and_chain(self):
+        self.assertEqual(_extract_cli_name("cd /repo && playwright-cli snapshot"), "playwright-cli")
+
+    def test_does_not_split_on_pipe_inside_quotes(self):
+        # Regression: a naive split on '|' breaks on the literal pipe inside
+        # a grep pattern, producing a garbage fragment instead of "grep".
+        self.assertEqual(_extract_cli_name('grep -n "a|b" file.py'), "grep")
+
+    def test_does_not_split_on_semicolon_inside_quotes(self):
+        self.assertEqual(_extract_cli_name('grep -n "a;b" file.py'), "grep")
+
+    def test_none_command(self):
+        self.assertIsNone(_extract_cli_name(None))
+
+    def test_empty_command(self):
+        self.assertIsNone(_extract_cli_name("   "))
 
 
 class TestProjectNameFromCwd(unittest.TestCase):

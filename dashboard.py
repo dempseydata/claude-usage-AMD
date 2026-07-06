@@ -43,7 +43,11 @@ def get_dashboard_data(db_path=DB_PATH):
     # so this is a cheap no-op once migrated.
     init_db(conn)
 
-    # ── All models (for filter UI) ────────────────────────────────────────────
+    # Every below-the-fold dataset joins sessions for project_name, since the
+    # Projects multi-select filter needs to narrow all of them, same as models.
+    PROJECT_EXPR = "COALESCE(NULLIF(s.project_name, ''), 'unknown')"
+
+    # ── All models / projects (for filter UI) ─────────────────────────────────
     # GROUP BY uses the normalised expression too so NULL and '' don't end up
     # as two separate "unknown" rows.
     model_rows = conn.execute("""
@@ -54,24 +58,35 @@ def get_dashboard_data(db_path=DB_PATH):
     """).fetchall()
     all_models = [r["model"] for r in model_rows]
 
-    # ── Daily per-model, ALL history (client filters by range) ────────────────
-    daily_rows = conn.execute("""
+    project_rows = conn.execute("""
+        SELECT COALESCE(NULLIF(project_name, ''), 'unknown') as project
+        FROM sessions
+        GROUP BY COALESCE(NULLIF(project_name, ''), 'unknown')
+        ORDER BY project COLLATE NOCASE
+    """).fetchall()
+    all_projects = [r["project"] for r in project_rows]
+
+    # ── Daily per-model per-project, ALL history (client filters by range) ────
+    daily_rows = conn.execute(f"""
         SELECT
-            substr(timestamp, 1, 10)   as day,
-            COALESCE(NULLIF(model, ''), 'unknown') as model,
-            SUM(input_tokens)          as input,
-            SUM(output_tokens)         as output,
-            SUM(cache_read_tokens)     as cache_read,
-            SUM(cache_creation_tokens) as cache_creation,
-            COUNT(*)                   as turns
-        FROM turns
-        GROUP BY day, COALESCE(NULLIF(model, ''), 'unknown')
+            substr(t.timestamp, 1, 10)                as day,
+            COALESCE(NULLIF(t.model, ''), 'unknown')  as model,
+            {PROJECT_EXPR}                             as project,
+            SUM(t.input_tokens)                       as input,
+            SUM(t.output_tokens)                      as output,
+            SUM(t.cache_read_tokens)                  as cache_read,
+            SUM(t.cache_creation_tokens)               as cache_creation,
+            COUNT(*)                                  as turns
+        FROM turns t
+        LEFT JOIN sessions s ON s.session_id = t.session_id
+        GROUP BY day, COALESCE(NULLIF(t.model, ''), 'unknown'), project
         ORDER BY day, model
     """).fetchall()
 
     daily_by_model = [{
         "day":            r["day"],
         "model":          r["model"],
+        "project":        r["project"],
         "input":          r["input"] or 0,
         "output":         r["output"] or 0,
         "cache_read":     r["cache_read"] or 0,
@@ -79,18 +94,26 @@ def get_dashboard_data(db_path=DB_PATH):
         "turns":          r["turns"] or 0,
     } for r in daily_rows]
 
-    # ── Hourly per-day per-model (client filters by range + TZ-shifts) ────────
+    # ── Hourly per-day per-model per-project (client filters by range + TZ) ───
     # Timestamps are ISO8601 UTC (e.g. "2026-04-08T09:30:00Z"); chars 12-13 = hour.
-    hourly_rows = conn.execute("""
+    # Carries full input/output/cache sums (not just output) so the below-the-fold
+    # By Model / Cost by Model views can also use this as their hour-resolution
+    # source when an hour/minute Timeline selection is narrowing the page.
+    hourly_rows = conn.execute(f"""
         SELECT
-            substr(timestamp, 1, 10)                  as day,
-            CAST(substr(timestamp, 12, 2) AS INTEGER) as hour,
-            COALESCE(NULLIF(model, ''), 'unknown')    as model,
-            SUM(output_tokens)                        as output,
+            substr(t.timestamp, 1, 10)                as day,
+            CAST(substr(t.timestamp, 12, 2) AS INTEGER) as hour,
+            COALESCE(NULLIF(t.model, ''), 'unknown')  as model,
+            {PROJECT_EXPR}                             as project,
+            SUM(t.input_tokens)                       as input,
+            SUM(t.output_tokens)                      as output,
+            SUM(t.cache_read_tokens)                  as cache_read,
+            SUM(t.cache_creation_tokens)               as cache_creation,
             COUNT(*)                                  as turns
-        FROM turns
-        WHERE timestamp IS NOT NULL AND length(timestamp) >= 13
-        GROUP BY day, hour, COALESCE(NULLIF(model, ''), 'unknown')
+        FROM turns t
+        LEFT JOIN sessions s ON s.session_id = t.session_id
+        WHERE t.timestamp IS NOT NULL AND length(t.timestamp) >= 13
+        GROUP BY day, hour, COALESCE(NULLIF(t.model, ''), 'unknown'), project
         ORDER BY day, hour, model
     """).fetchall()
 
@@ -98,7 +121,11 @@ def get_dashboard_data(db_path=DB_PATH):
         "day":    r["day"],
         "hour":   r["hour"] if r["hour"] is not None else 0,
         "model":  r["model"],
+        "project":        r["project"],
+        "input":          r["input"] or 0,
         "output": r["output"] or 0,
+        "cache_read":     r["cache_read"] or 0,
+        "cache_creation": r["cache_creation"] or 0,
         "turns":  r["turns"] or 0,
     } for r in hourly_rows]
 
@@ -149,11 +176,16 @@ def get_dashboard_data(db_path=DB_PATH):
         "ELSE 'unknown' END)"
     )
 
+    # Project comes from the dispatching *parent* session (agents.dispatched_in_session),
+    # not t.session_id — the subagent's own transcript session isn't guaranteed to
+    # carry the same project_name mapping.
     subagent_daily_rows = conn.execute(f"""
         SELECT
             substr(t.timestamp, 1, 10)               as day,
+            CAST(substr(t.timestamp, 12, 2) AS INTEGER) as hour,
             {AGENT_TYPE_EXPR}                        as agent_type,
             COALESCE(NULLIF(t.model, ''), 'unknown') as model,
+            COALESCE(NULLIF(s.project_name, ''), 'unknown') as project,
             SUM(t.input_tokens)                      as input,
             SUM(t.output_tokens)                     as output,
             SUM(t.cache_read_tokens)                 as cache_read,
@@ -162,15 +194,18 @@ def get_dashboard_data(db_path=DB_PATH):
             COUNT(*)                                 as turns
         FROM turns t
         LEFT JOIN agents a ON t.agent_id = a.agent_id
+        LEFT JOIN sessions s ON s.session_id = a.dispatched_in_session
         WHERE t.is_subagent = 1
-        GROUP BY day, agent_type, model
+        GROUP BY day, hour, agent_type, COALESCE(NULLIF(t.model, ''), 'unknown'), project
         ORDER BY day, agent_type
     """).fetchall()
 
     subagent_by_type = [{
         "day":            r["day"],
+        "hour":           r["hour"] if r["hour"] is not None else 0,
         "agent_type":     r["agent_type"],
         "model":          r["model"],
+        "project":        r["project"],
         "input":          r["input"] or 0,
         "output":         r["output"] or 0,
         "cache_read":     r["cache_read"] or 0,
@@ -185,6 +220,7 @@ def get_dashboard_data(db_path=DB_PATH):
             t.agent_id                               as agent_id,
             {AGENT_TYPE_EXPR}                        as agent_type,
             COALESCE(NULLIF(t.model, ''), 'unknown') as model,
+            COALESCE(NULLIF(s.project_name, ''), 'unknown') as project,
             MIN(t.timestamp)                         as start_ts,
             SUM(t.input_tokens)                      as input,
             SUM(t.output_tokens)                     as output,
@@ -197,6 +233,7 @@ def get_dashboard_data(db_path=DB_PATH):
             a.status                                 as status
         FROM turns t
         LEFT JOIN agents a ON t.agent_id = a.agent_id
+        LEFT JOIN sessions s ON s.session_id = a.dispatched_in_session
         WHERE t.is_subagent = 1 AND t.agent_id IS NOT NULL
         GROUP BY t.agent_id
         ORDER BY (SUM(t.input_tokens) + SUM(t.output_tokens)
@@ -207,6 +244,7 @@ def get_dashboard_data(db_path=DB_PATH):
         "agent_id":       r["agent_id"],
         "agent_type":     r["agent_type"],
         "model":          r["model"],
+        "project":        r["project"],
         "start":          (r["start_ts"] or "")[:16].replace("T", " "),
         "start_date":     (r["start_ts"] or "")[:10],
         "input":          r["input"] or 0,
@@ -219,29 +257,34 @@ def get_dashboard_data(db_path=DB_PATH):
         "status":         r["status"],
     } for r in top_dispatch_rows]
 
-    # ── Skill usage, by day & model (client filters by range + model) ─────────
+    # ── Skill usage, by day/hour, model & project ─────────────────────────────
     # skill_name is only populated for tool_name='Skill' turns (see scanner.py) —
     # every other turn has it NULL and is excluded here.
-    skill_daily_rows = conn.execute("""
+    skill_daily_rows = conn.execute(f"""
         SELECT
-            substr(timestamp, 1, 10)                 as day,
-            skill_name                                as skill,
-            COALESCE(NULLIF(model, ''), 'unknown')    as model,
-            SUM(input_tokens)                         as input,
-            SUM(output_tokens)                        as output,
-            SUM(cache_read_tokens)                    as cache_read,
-            SUM(cache_creation_tokens)                as cache_creation,
+            substr(t.timestamp, 1, 10)               as day,
+            CAST(substr(t.timestamp, 12, 2) AS INTEGER) as hour,
+            t.skill_name                              as skill,
+            COALESCE(NULLIF(t.model, ''), 'unknown')  as model,
+            {PROJECT_EXPR}                             as project,
+            SUM(t.input_tokens)                       as input,
+            SUM(t.output_tokens)                      as output,
+            SUM(t.cache_read_tokens)                  as cache_read,
+            SUM(t.cache_creation_tokens)               as cache_creation,
             COUNT(*)                                  as turns
-        FROM turns
-        WHERE skill_name IS NOT NULL AND skill_name != ''
-        GROUP BY day, skill, model
+        FROM turns t
+        LEFT JOIN sessions s ON s.session_id = t.session_id
+        WHERE t.skill_name IS NOT NULL AND t.skill_name != ''
+        GROUP BY day, hour, skill, COALESCE(NULLIF(t.model, ''), 'unknown'), project
         ORDER BY day, skill
     """).fetchall()
 
     skill_by_day = [{
         "day":            r["day"],
+        "hour":           r["hour"] if r["hour"] is not None else 0,
         "skill":          r["skill"],
         "model":          r["model"],
+        "project":        r["project"],
         "input":          r["input"] or 0,
         "output":         r["output"] or 0,
         "cache_read":     r["cache_read"] or 0,
@@ -249,31 +292,39 @@ def get_dashboard_data(db_path=DB_PATH):
         "turns":          r["turns"] or 0,
     } for r in skill_daily_rows]
 
-    # ── Tool usage, by day & model (client filters by range + model) ──────────
+    # ── Tool usage, by day/hour, model & project ──────────────────────────────
     # Raw tool_name per row (e.g. "Bash", "mcp__playwright__browser_click") —
-    # the client collapses "mcp__<server>__<tool>" down to its MCP server for
-    # the "Token Usage by MCP / CLI" table, same all-history-shipped pattern
-    # as daily_by_model.
-    tool_daily_rows = conn.execute("""
+    # the client collapses "mcp__<server>__<tool>" down to its MCP server, and
+    # "Bash" + cli_name down to "CLI: <name>" (see toolGroupLabel), for the
+    # "Token Usage by MCP / CLI" table. cli_name is only populated for
+    # tool_name='Bash' turns (the command's first word — see scanner.py).
+    tool_daily_rows = conn.execute(f"""
         SELECT
-            substr(timestamp, 1, 10)                 as day,
-            tool_name                                 as tool_name,
-            COALESCE(NULLIF(model, ''), 'unknown')    as model,
-            SUM(input_tokens)                         as input,
-            SUM(output_tokens)                        as output,
-            SUM(cache_read_tokens)                    as cache_read,
-            SUM(cache_creation_tokens)                as cache_creation,
+            substr(t.timestamp, 1, 10)               as day,
+            CAST(substr(t.timestamp, 12, 2) AS INTEGER) as hour,
+            t.tool_name                               as tool_name,
+            t.cli_name                                as cli_name,
+            COALESCE(NULLIF(t.model, ''), 'unknown')  as model,
+            {PROJECT_EXPR}                             as project,
+            SUM(t.input_tokens)                       as input,
+            SUM(t.output_tokens)                      as output,
+            SUM(t.cache_read_tokens)                  as cache_read,
+            SUM(t.cache_creation_tokens)               as cache_creation,
             COUNT(*)                                  as turns
-        FROM turns
-        WHERE tool_name IS NOT NULL AND tool_name != ''
-        GROUP BY day, tool_name, model
+        FROM turns t
+        LEFT JOIN sessions s ON s.session_id = t.session_id
+        WHERE t.tool_name IS NOT NULL AND t.tool_name != ''
+        GROUP BY day, hour, tool_name, cli_name, COALESCE(NULLIF(t.model, ''), 'unknown'), project
         ORDER BY day, tool_name
     """).fetchall()
 
     tool_by_day = [{
         "day":            r["day"],
+        "hour":           r["hour"] if r["hour"] is not None else 0,
         "tool_name":      r["tool_name"],
+        "cli_name":       r["cli_name"],
         "model":          r["model"],
+        "project":        r["project"],
         "input":          r["input"] or 0,
         "output":         r["output"] or 0,
         "cache_read":     r["cache_read"] or 0,
@@ -285,6 +336,7 @@ def get_dashboard_data(db_path=DB_PATH):
 
     return {
         "all_models":      all_models,
+        "all_projects":    all_projects,
         "daily_by_model":  daily_by_model,
         "hourly_by_model": hourly_by_model,
         "sessions_all":    sessions_all,
@@ -300,6 +352,7 @@ def get_dashboard_data(db_path=DB_PATH):
 # a fixed whitelist (never built from request input) so the granularity param
 # can't be used to smuggle an arbitrary format string into the query.
 TIMELINE_FORMATS = {
+    "day":    "%Y-%m-%d",
     "minute": "%Y-%m-%d %H:%M",
     "hour":   "%Y-%m-%d %H:00",
 }
@@ -322,7 +375,7 @@ def get_timeline_data(db_path=DB_PATH, granularity="hour", start=None, end=None)
     client" pattern the daily/hourly charts use.
     """
     if granularity not in TIMELINE_FORMATS:
-        return {"error": "invalid granularity: %r (expected 'minute' or 'hour')" % granularity}
+        return {"error": "invalid granularity: %r (expected 'day', 'hour', or 'minute')" % granularity}
 
     if granularity == "minute":
         if not start or not end:
@@ -361,7 +414,7 @@ def get_timeline_data(db_path=DB_PATH, granularity="hour", start=None, end=None)
         WHERE t.timestamp IS NOT NULL AND length(t.timestamp) >= 13
           AND (? IS NULL OR substr(t.timestamp, 1, 10) >= ?)
           AND (? IS NULL OR substr(t.timestamp, 1, 10) <= ?)
-        GROUP BY bucket, project, t.model
+        GROUP BY bucket, project, COALESCE(NULLIF(t.model, ''), 'unknown')
         ORDER BY bucket
     """, (TIMELINE_FORMATS[granularity], start, start, end, end)).fetchall()
     conn.close()
@@ -436,9 +489,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #rescan-btn:hover { color: var(--text); border-color: var(--accent); }
   #rescan-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-  #filter-bar { background: var(--card); border-bottom: 1px solid var(--border); padding: 10px 24px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  /* No longer a full-bleed sticky top bar — it lives between the fixed 30-day
+     overview and the filterable sections, so it reads as a card like the rest. */
+  #filter-bar { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
   .filter-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
   .filter-sep { width: 1px; height: 22px; background: var(--border); flex-shrink: 0; }
+  .filter-hint { font-size: 11px; color: var(--muted); width: 100%; margin-top: 2px; }
   /* Model multi-select: a compact trigger in the bar that opens a grouped panel. */
   .model-select { position: relative; flex-shrink: 0; }
   .model-trigger { display: flex; align-items: center; gap: 8px; min-width: 170px; max-width: 320px; padding: 5px 10px; background: var(--card); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 12px; cursor: pointer; transition: border-color 0.15s; }
@@ -583,48 +639,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <button id="rescan-btn" onclick="triggerRescan()" title="Scan for new usage since the last update. Adds new turns without affecting existing history.">&#x21bb; Rescan</button>
 </header>
 
-<div id="filter-bar">
-  <div class="filter-label">Models</div>
-  <div class="model-select" id="model-select">
-    <button class="model-trigger" id="model-trigger" aria-haspopup="true" aria-expanded="false" onclick="toggleModelPanel(event)">
-      <span id="model-trigger-label">All models</span>
-      <span class="model-caret">&#9662;</span>
-    </button>
-    <div class="model-panel" id="model-panel" hidden>
-      <div class="model-panel-actions">
-        <button class="filter-btn" onclick="selectAllModels()">All</button>
-        <button class="filter-btn" onclick="clearAllModels()">None</button>
-      </div>
-      <div id="model-checkboxes"></div>
-    </div>
-  </div>
-  <div class="filter-sep"></div>
-  <div class="filter-label">Range</div>
-  <div class="range-select">
-    <select id="range-select" aria-label="Date range" onchange="setRange(this.value)">
-      <option value="today">Today</option>
-      <option value="yesterday">Yesterday</option>
-      <option value="week">This Week</option>
-      <option value="month">This Month</option>
-      <option value="prev-month">Previous Month</option>
-      <option value="7d">Last 7 Days</option>
-      <option value="30d">Last 30 Days</option>
-      <option value="90d">Last 90 Days</option>
-      <option value="all">All Time</option>
-    </select>
-  </div>
-</div>
-
 <div class="container">
   <div class="stats-row" id="stats-row"></div>
   <div class="charts-grid">
     <div class="chart-card wide" id="sec-daily" data-card="daily">
-      <h2><span class="card-caret">&#9656;</span><span id="daily-chart-title">Daily Token Usage</span></h2>
+      <h2><span class="card-caret">&#9656;</span><span id="daily-chart-title">Daily Token Usage — Last 30 Days</span></h2>
       <div class="chart-wrap tall"><canvas id="chart-daily"></canvas></div>
     </div>
     <div class="chart-card wide" id="sec-hourly" data-card="hourly">
       <div class="chart-header">
-        <h2><span class="card-caret">&#9656;</span><span id="hourly-chart-title">Average Hourly Distribution</span></h2>
+        <h2><span class="card-caret">&#9656;</span><span id="hourly-chart-title">Average Hourly Distribution — Last 30 Days</span></h2>
         <div class="chart-header-right">
           <span class="peak-legend" title="Mon–Fri 05:00–11:00 PT — Anthropic peak-hour throttling window"><span class="peak-swatch"></span>Peak hours (PT)</span>
           <span class="chart-day-count" id="hourly-day-count"></span>
@@ -636,6 +660,57 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
       <div class="chart-wrap"><canvas id="chart-hourly"></canvas></div>
     </div>
+  </div>
+
+  <div id="filter-bar">
+    <div class="filter-label">Models</div>
+    <div class="model-select" id="model-select">
+      <button class="model-trigger" id="model-trigger" aria-haspopup="true" aria-expanded="false" onclick="toggleModelPanel(event)">
+        <span id="model-trigger-label">All models</span>
+        <span class="model-caret">&#9662;</span>
+      </button>
+      <div class="model-panel" id="model-panel" hidden>
+        <div class="model-panel-actions">
+          <button class="filter-btn" onclick="selectAllModels()">All</button>
+          <button class="filter-btn" onclick="clearAllModels()">None</button>
+        </div>
+        <div id="model-checkboxes"></div>
+      </div>
+    </div>
+    <div class="filter-sep"></div>
+    <div class="filter-label">Projects</div>
+    <div class="model-select" id="project-select">
+      <button class="model-trigger" id="project-trigger" aria-haspopup="true" aria-expanded="false" onclick="toggleProjectPanel(event)">
+        <span id="project-trigger-label">All projects</span>
+        <span class="model-caret">&#9662;</span>
+      </button>
+      <div class="model-panel" id="project-panel" hidden>
+        <div class="model-panel-actions">
+          <button class="filter-btn" onclick="selectAllProjects()">All</button>
+          <button class="filter-btn" onclick="clearAllProjects()">None</button>
+        </div>
+        <div id="project-checkboxes"></div>
+      </div>
+    </div>
+    <div class="filter-sep"></div>
+    <div class="filter-label">Range</div>
+    <div class="range-select">
+      <select id="range-select" aria-label="Date range" onchange="setRange(this.value)">
+        <option value="today">Today</option>
+        <option value="yesterday">Yesterday</option>
+        <option value="week">This Week</option>
+        <option value="month">This Month</option>
+        <option value="prev-month">Previous Month</option>
+        <option value="7d">Last 7 Days</option>
+        <option value="30d">Last 30 Days</option>
+        <option value="90d">Last 90 Days</option>
+        <option value="all">All Time</option>
+      </select>
+    </div>
+    <div class="filter-hint">Filters below apply to everything from Usage Timeline down.</div>
+  </div>
+
+  <div class="charts-grid">
     <div class="chart-card wide" id="sec-timeline" data-card="timeline">
       <div class="chart-header">
         <h2><span class="card-caret">&#9656;</span><span id="timeline-chart-title">Usage Timeline by Project</span></h2>
@@ -643,6 +718,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <span class="chart-day-count" id="timeline-note"></span>
           <button class="tz-btn" id="timeline-reset-btn" onclick="resetTimelineSelection()" disabled>Reset selection</button>
           <div class="tz-group">
+            <button class="tz-btn" data-gran="day"    onclick="setTimelineGranularity('day')">Day</button>
             <button class="tz-btn" data-gran="hour"   onclick="setTimelineGranularity('hour')">Hour</button>
             <button class="tz-btn" data-gran="minute" onclick="setTimelineGranularity('minute')">Minute</button>
           </div>
@@ -658,7 +734,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           </table>
         </div>
       </div>
-      <p class="timeline-hint">Drag across the chart to select a time range. Double-click or "Reset selection" to clear.</p>
+      <p class="timeline-hint">Drag across the chart to select a time range — narrows every chart/table below. Double-click or "Reset selection" to clear.</p>
     </div>
     <div class="chart-card" id="sec-models" data-card="model-chart">
       <h2><span class="card-caret">&#9656;</span>By Model</h2>
@@ -1091,21 +1167,40 @@ function setRange(range) {
   selectedRange = range;
   const sel = document.getElementById('range-select');
   if (sel) sel.value = range;  // keep the dropdown in sync with programmatic calls
+  // A day-range change invalidates any hour/minute assumptions (minute is
+  // only ever valid for Today/Yesterday) and any active drag-selection (its
+  // bucket shape belongs to the old range) — reset both to this range's default.
+  timelineGranularity = defaultTimelineGranularity();
+  timelineSelection = null;
+  timelineMinuteWindow = null;
   updateURL();
   applyFilter();
   scheduleAutoRefresh();
   fetchTimeline();  // range changed -> Usage Timeline is server-scoped, needs a fresh query
 }
 
-// ── Usage Timeline (minute/hour buckets grouped by project) ────────────────
+// -- Usage Timeline (day/hour/minute buckets grouped by project) -----------
 // Queried fresh per range/granularity change rather than folded into rawData
 // like the daily/hourly charts, since minute buckets over unbounded history
 // would be a huge payload (see get_timeline_data's docstring server-side).
-let timelineGranularity = 'hour';
+let timelineGranularity = 'day';
 let timelineRawRows = [];
+// A saved Hour-granularity selection, converted to minute-bucket bounds, so
+// switching into Minute view zooms into that hour range instead of showing
+// the whole day's 1440 buckets. Cleared whenever it's no longer applicable.
+let timelineMinuteWindow = null;
 
+function defaultTimelineGranularity() {
+  return (selectedRange === 'today' || selectedRange === 'yesterday') ? 'hour' : 'day';
+}
+
+// Minute view is only offered once the user has drag-selected a genuine
+// subset of the currently-visible Hour buckets -- otherwise there's nothing
+// meaningful to zoom into at minute resolution.
 function timelineMinuteAllowed() {
-  return selectedRange === 'today' || selectedRange === 'yesterday';
+  return timelineGranularity === 'hour' && !!timelineSelection &&
+    timelineBuckets.length > 0 &&
+    (timelineSelection.start !== timelineBuckets[0] || timelineSelection.end !== timelineBuckets[timelineBuckets.length - 1]);
 }
 
 // Advance a plain 'YYYY-MM-DD' string by `delta` days, anchored in UTC so the
@@ -1117,23 +1212,55 @@ function addDaysISO(dateStr, delta) {
   return dt.toISOString().slice(0, 10);
 }
 
-// Every hour/minute bucket the chart should show, including ones with no
+// Advance a 'YYYY-MM-DD HH:MM' bucket string by one minute, UTC-anchored for
+// the same DST-safety reason as addDaysISO.
+function addMinuteISO(bucket) {
+  const [datePart, timePart] = bucket.split(' ');
+  const [y, m, d] = datePart.split('-').map(Number);
+  const [hh, mm] = timePart.split(':').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d, hh, mm));
+  dt.setUTCMinutes(dt.getUTCMinutes() + 1);
+  const pad = n => String(n).padStart(2, '0');
+  return dt.getUTCFullYear() + '-' + pad(dt.getUTCMonth() + 1) + '-' + pad(dt.getUTCDate()) +
+    ' ' + pad(dt.getUTCHours()) + ':' + pad(dt.getUTCMinutes());
+}
+
+// Every day/hour/minute bucket the chart should show, including ones with no
 // data (so the axis reads as a continuous timeline, not just the moments
 // something happened). Returns null for an unbounded range (All Time, or the
-// open-ended Nd ranges with no end) — there's no fixed extent to fill, so the
-// caller falls back to whatever buckets the data actually has.
-function timelineExpectedBuckets(start, end, granularity) {
+// open-ended Nd ranges with no end) -- there's no fixed extent to fill, so
+// the caller falls back to whatever buckets the data actually has.
+function timelineExpectedBuckets(start, end, granularity, minuteWindow) {
+  if (granularity === 'minute' && minuteWindow) {
+    // Scoped to a specific hour range (from a prior Hour-granularity
+    // selection) rather than the whole day, so switching to Minute actually
+    // zooms in instead of dumping all 1440 buckets.
+    const buckets = [];
+    let cur = minuteWindow.start;
+    let guard = 0;
+    while (cur <= minuteWindow.end && guard < 1440) {
+      buckets.push(cur);
+      cur = addMinuteISO(cur);
+      guard++;
+    }
+    return buckets;
+  }
+
   if (!start && !end) return null;
   const startDate = start || end;
   const endDate = end || new Date().toISOString().slice(0, 10);
   const buckets = [];
   let d = startDate;
   for (let i = 0; i < 366 && d <= endDate; i++) {  // bounded walk, defensive against a bad range
-    for (let h = 0; h < 24; h++) {
-      if (granularity === 'hour') {
-        buckets.push(d + ' ' + String(h).padStart(2, '0') + ':00');
-      } else {
-        for (let m = 0; m < 60; m++) buckets.push(d + ' ' + String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0'));
+    if (granularity === 'day') {
+      buckets.push(d);
+    } else {
+      for (let h = 0; h < 24; h++) {
+        if (granularity === 'hour') {
+          buckets.push(d + ' ' + String(h).padStart(2, '0') + ':00');
+        } else {
+          for (let mi = 0; mi < 60; mi++) buckets.push(d + ' ' + String(h).padStart(2, '0') + ':' + String(mi).padStart(2, '0'));
+        }
       }
     }
     d = addDaysISO(d, 1);
@@ -1142,7 +1269,16 @@ function timelineExpectedBuckets(start, end, granularity) {
 }
 
 function setTimelineGranularity(g) {
-  if (g === 'minute' && !timelineMinuteAllowed()) return;
+  if (g === 'minute') {
+    if (!timelineMinuteAllowed()) return;
+    // Carry the current Hour selection over as the Minute view's window
+    // (":00"->start of hour, ":59" -> end of that hour) instead of clearing it.
+    timelineMinuteWindow = { start: timelineSelection.start, end: timelineSelection.end.slice(0, 13) + ':59' };
+    timelineSelection = { start: timelineMinuteWindow.start, end: timelineMinuteWindow.end };
+  } else {
+    timelineMinuteWindow = null;
+    timelineSelection = null;  // a Day/Hour selection's bucket shape doesn't carry over
+  }
   timelineGranularity = g;
   fetchTimeline();
 }
@@ -1156,11 +1292,10 @@ function updateTimelineButtons() {
 }
 
 async function fetchTimeline() {
-  if (timelineGranularity === 'minute' && !timelineMinuteAllowed()) timelineGranularity = 'hour';
   updateTimelineButtons();
 
   document.getElementById('timeline-chart-title').textContent =
-    'Usage Timeline by Project \u2014 ' + RANGE_LABELS[selectedRange];
+    'Usage Timeline by Project — ' + RANGE_LABELS[selectedRange];
 
   const { start, end } = getRangeBounds(selectedRange);
   const params = new URLSearchParams({ granularity: timelineGranularity });
@@ -1185,18 +1320,19 @@ async function fetchTimeline() {
   refilterTimeline();
 }
 
-// Client-side model re-filter of the already-fetched timeline rows — cheap,
-// so model checkbox toggles (which call applyFilter, not fetchTimeline) can
-// refresh this chart too without hitting the server again.
+// Client-side model+project re-filter of the already-fetched timeline rows --
+// cheap, so model/project checkbox toggles (which call applyFilter, not
+// fetchTimeline) can refresh this chart too without hitting the server again.
 function refilterTimeline() {
-  renderTimelineChart(timelineRawRows.filter(r => selectedModels.has(r.model)));
+  renderTimelineChart(timelineRawRows.filter(r => selectedModels.has(r.model) && selectedProjects.has(r.project)));
 }
 
 // Selection state for the drag-to-select range on the timeline chart. The
 // chart itself is destroyed/rebuilt on every range/granularity/model change
 // (same pattern as the rest of the dashboard), so an active drag-selection is
-// intentionally cleared whenever that happens — persisting it across a data
-// change isn't worth the extra bookkeeping.
+// intentionally cleared whenever that happens -- persisting it across a data
+// change isn't worth the extra bookkeeping (except the Hour->Minute handoff
+// above, which is the one case worth preserving).
 let timelineBuckets = [];
 let timelineFilteredRows = [];
 
@@ -1208,7 +1344,7 @@ function renderTimelineChart(rows) {
     const tok = r.input + r.output + r.cache_read + r.cache_creation;
     projTotals[r.project] = (projTotals[r.project] || 0) + tok;
   }
-  // Cap series count so the stacked chart / legend stay readable — fold the
+  // Cap series count so the stacked chart / legend stay readable -- fold the
   // long tail of smaller projects into "Other" rather than showing dozens.
   const topProjects = Object.entries(projTotals)
     .sort((a, b) => b[1] - a[1])
@@ -1219,13 +1355,14 @@ function renderTimelineChart(rows) {
   const labels = hasOther ? [...topProjects, 'Other'] : topProjects;
 
   const { start, end } = getRangeBounds(selectedRange);
-  const buckets = timelineExpectedBuckets(start, end, timelineGranularity)
+  const buckets = timelineExpectedBuckets(start, end, timelineGranularity, timelineMinuteWindow)
     || [...new Set(rows.map(r => r.bucket))].sort();
   timelineBuckets = buckets;
   const bucketIndex = new Map(buckets.map((b, i) => [b, i]));
   const seriesMap = {};
   for (const label of labels) seriesMap[label] = buckets.map(() => 0);
   for (const r of rows) {
+    if (!bucketIndex.has(r.bucket)) continue;  // outside the current minute window, if any
     const key = topSet.has(r.project) ? r.project : (hasOther ? 'Other' : null);
     if (!key) continue;
     seriesMap[key][bucketIndex.get(r.bucket)] += r.input + r.output + r.cache_read + r.cache_creation;
@@ -1253,7 +1390,7 @@ function renderTimelineChart(rows) {
       maintainAspectRatio: false,
       plugins: {
         legend: { onClick: legendToggle('timeline'), labels: { color: C.axis, boxWidth: 12 } },
-        // Drag across the bars to zoom into a range — chartjs-plugin-zoom
+        // Drag across the bars to zoom into a range -- chartjs-plugin-zoom
         // (loaded via CDN alongside Chart.js) auto-registers against the
         // global Chart object, no explicit Chart.register() needed. Pan is
         // off so drag always means "select a range", not "scroll the chart".
@@ -1279,30 +1416,45 @@ function renderTimelineChart(rows) {
   // canvas rather than through a chart option.
   ctx.canvas.ondblclick = resetTimelineSelection;
 
-  renderTimelineProjectTable(rows, null);
+  renderTimelineProjectTable(rows, timelineSelection);
 }
 
 // Reads the zoomed x-axis range (bar-index based, since our x scale is a
-// category/labels axis) off the chart and re-aggregates the project subtotal
-// table to just the selected buckets. Falls back to the full range if the
-// drag ended up covering everything (no real selection).
+// category/labels axis) off the chart, persists it as the shared
+// timelineSelection (which cascades down to every chart/table below via
+// applyFilter), and re-aggregates the project subtotal table to match.
 function applyTimelineSelectionFromChart(chart) {
   const xScale = chart.scales.x;
   if (!xScale || !timelineBuckets.length) return;
   const minIdx = Math.max(0, Math.round(xScale.min));
   const maxIdx = Math.min(timelineBuckets.length - 1, Math.round(xScale.max));
   if (minIdx <= 0 && maxIdx >= timelineBuckets.length - 1) {
-    renderTimelineProjectTable(timelineFilteredRows, null);
-    return;
+    timelineSelection = null;
+  } else {
+    timelineSelection = { start: timelineBuckets[minIdx], end: timelineBuckets[maxIdx] };
   }
-  const selectedBuckets = new Set(timelineBuckets.slice(minIdx, maxIdx + 1));
-  const subset = timelineFilteredRows.filter(r => selectedBuckets.has(r.bucket));
-  renderTimelineProjectTable(subset, { start: timelineBuckets[minIdx], end: timelineBuckets[maxIdx] });
+  updateTimelineButtons();  // Minute availability may have just changed
+  const selectedBuckets = timelineSelection ? new Set(timelineBuckets.slice(minIdx, maxIdx + 1)) : null;
+  const subset = selectedBuckets ? timelineFilteredRows.filter(r => selectedBuckets.has(r.bucket)) : timelineFilteredRows;
+  renderTimelineProjectTable(subset, timelineSelection);
+  applyFilter();  // cascade the selection to everything below the Timeline chart
 }
 
 function resetTimelineSelection() {
   if (charts.timeline && charts.timeline.resetZoom) charts.timeline.resetZoom();
-  renderTimelineProjectTable(timelineFilteredRows, null);
+  timelineSelection = null;
+  timelineMinuteWindow = null;
+  // Minute view has no meaning without a selection to scope it — drop back
+  // to Hour instead of leaving the chart showing a full unscoped day.
+  const needsRefetch = timelineGranularity === 'minute';
+  if (needsRefetch) timelineGranularity = 'hour';
+  updateTimelineButtons();
+  if (needsRefetch) {
+    fetchTimeline();  // hour has a different bucket set than minute — needs a fresh query
+  } else {
+    renderTimelineProjectTable(timelineFilteredRows, null);
+  }
+  applyFilter();
 }
 
 function renderTimelineProjectTable(rows, range) {
@@ -1473,8 +1625,10 @@ function closeModelPanel() {
 document.addEventListener('click', (e) => {
   const sel = document.getElementById('model-select');
   if (sel && !sel.contains(e.target)) closeModelPanel();
+  const psel = document.getElementById('project-select');
+  if (psel && !psel.contains(e.target)) closeProjectPanel();
 });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModelPanel(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeModelPanel(); closeProjectPanel(); } });
 
 function onModelToggle(cb) {
   const label = cb.closest('label');
@@ -1499,12 +1653,101 @@ function clearAllModels() {
   updateModelTriggerLabel(); updateURL(); applyFilter();
 }
 
+// ── Project filter (mirrors the Model filter above, minus the Anthropic/other
+// grouping — projects have no natural grouping) ─────────────────────────────
+let selectedProjects = new Set();
+let allProjectsList = [];
+
+function readURLProjects(allProjects) {
+  const param = new URLSearchParams(window.location.search).get('projects');
+  if (!param) return new Set(allProjects);
+  const fromURL = new Set(param.split(',').map(s => s.trim()).filter(Boolean));
+  return new Set(allProjects.filter(p => fromURL.has(p)));
+}
+
+function isDefaultProjectSelection(allProjects) {
+  if (selectedProjects.size !== allProjects.length) return false;
+  return allProjects.every(p => selectedProjects.has(p));
+}
+
+function buildProjectFilterUI(allProjects) {
+  allProjectsList = [...allProjects];
+  selectedProjects = readURLProjects(allProjects);
+  const sorted = [...allProjects].sort((a, b) => a.localeCompare(b));
+  const rowHTML = p => {
+    const checked = selectedProjects.has(p);
+    return `<label class="model-cb-label ${checked ? 'checked' : ''}" data-model="${esc(p)}" title="${esc(p)}">
+      <input type="checkbox" value="${esc(p)}" ${checked ? 'checked' : ''} onchange="onProjectToggle(this)">
+      <span class="model-cb-box">&#10003;</span>
+      <span class="model-cb-text">${esc(p)}</span>
+    </label>`;
+  };
+  document.getElementById('project-checkboxes').innerHTML = sorted.map(rowHTML).join('');
+  updateProjectTriggerLabel();
+}
+
+function updateProjectTriggerLabel() {
+  const labelEl = document.getElementById('project-trigger-label');
+  if (!labelEl) return;
+  const n = selectedProjects.size;
+  if (n === 0)                      { labelEl.textContent = 'No projects';  return; }
+  if (n === allProjectsList.length) { labelEl.textContent = 'All projects'; return; }
+  const chosen = [...allProjectsList].filter(p => selectedProjects.has(p)).sort((a, b) => a.localeCompare(b));
+  const shown = chosen.slice(0, 2);
+  const extra = chosen.length - shown.length;
+  labelEl.textContent = shown.join(', ') + (extra > 0 ? ' +' + extra : '');
+}
+
+function toggleProjectPanel(event) {
+  if (event) event.stopPropagation();
+  const panel = document.getElementById('project-panel');
+  const trigger = document.getElementById('project-trigger');
+  const open = panel.hidden;
+  panel.hidden = !open;
+  trigger.classList.toggle('open', open);
+  trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function closeProjectPanel() {
+  const panel = document.getElementById('project-panel');
+  if (!panel || panel.hidden) return;
+  panel.hidden = true;
+  const trigger = document.getElementById('project-trigger');
+  trigger.classList.remove('open');
+  trigger.setAttribute('aria-expanded', 'false');
+}
+
+function onProjectToggle(cb) {
+  const label = cb.closest('label');
+  if (cb.checked) { selectedProjects.add(cb.value);    label.classList.add('checked'); }
+  else            { selectedProjects.delete(cb.value); label.classList.remove('checked'); }
+  updateProjectTriggerLabel();
+  updateURL();
+  applyFilter();
+  fetchTimeline();
+}
+
+function selectAllProjects() {
+  document.querySelectorAll('#project-checkboxes input').forEach(cb => {
+    cb.checked = true; selectedProjects.add(cb.value); cb.closest('label').classList.add('checked');
+  });
+  updateProjectTriggerLabel(); updateURL(); applyFilter(); fetchTimeline();
+}
+
+function clearAllProjects() {
+  document.querySelectorAll('#project-checkboxes input').forEach(cb => {
+    cb.checked = false; selectedProjects.delete(cb.value); cb.closest('label').classList.remove('checked');
+  });
+  updateProjectTriggerLabel(); updateURL(); applyFilter(); fetchTimeline();
+}
+
 // ── URL persistence ────────────────────────────────────────────────────────
 function updateURL() {
   const allModels = Array.from(document.querySelectorAll('#model-checkboxes input')).map(cb => cb.value);
   const params = new URLSearchParams();
   if (selectedRange !== '30d') params.set('range', selectedRange);
   if (!isDefaultModelSelection(allModels)) params.set('models', Array.from(selectedModels).join(','));
+  if (!isDefaultProjectSelection(allProjectsList)) params.set('projects', Array.from(selectedProjects).join(','));
   const search = params.toString() ? '?' + params.toString() : '';
   history.replaceState(null, '', window.location.pathname + search);
 }
@@ -1547,31 +1790,59 @@ function sortSessions(sessions) {
 }
 
 // ── Aggregation & filtering ────────────────────────────────────────────────
+// ── Timeline cascading selection ────────────────────────────────────────────
+// A drag-selection on the Usage Timeline chart narrows every chart/table below
+// it, on top of the model/project/range filter bar above it. null = no
+// selection active (only the filter bar's range/model/project apply).
+let timelineSelection = null;  // { start: bucketStr, end: bucketStr } at timelineGranularity's resolution
+
+// Does a "day"+"hour" pair (the resolution the model/subagent/skill/tool
+// breakdowns carry) fall inside the active Timeline selection?
+function withinTimelineSelectionDayHour(day, hour) {
+  if (!timelineSelection) return true;
+  const { start, end } = timelineSelection;
+  if (timelineGranularity === 'day') return day >= start && day <= end;
+  // Hour/minute granularity: these breakdowns only carry hour resolution, so
+  // a minute-level selection is approximated to its enclosing hour range.
+  // ponytail: true minute precision here would need per-minute backend
+  // queries for these datasets -- upgrade if that granularity is ever needed
+  // for the model/subagent/skill/tool views specifically.
+  const key = day + ' ' + String(hour ?? 0).padStart(2, '0') + ':00';
+  return key >= start.slice(0, 13) + ':00' && key <= end.slice(0, 13) + ':00';
+}
+
+// Does a "YYYY-MM-DD HH:MM" timestamp (sessions/dispatches -- minute precision
+// already) fall inside the active Timeline selection? True precision here,
+// unlike the day-hour version above.
+function withinTimelineSelectionMinute(ts) {
+  if (!timelineSelection) return true;
+  const { start, end } = timelineSelection;
+  if (timelineGranularity === 'day') return ts.slice(0, 10) >= start && ts.slice(0, 10) <= end;
+  if (timelineGranularity === 'hour') return ts.slice(0, 13) >= start.slice(0, 13) && ts.slice(0, 13) <= end.slice(0, 13);
+  return ts >= start && ts <= end;
+}
+
+// Below-the-fold filtering: everything from the Usage Timeline chart down.
+// The top-3 fixed sections (key metrics, Daily, Average Hourly) are rendered
+// separately by renderTopFixed() and never touch selectedModels/Projects/
+// Range/timelineSelection -- see that function.
 function applyFilter() {
   if (!rawData) return;
 
   const { start, end } = getRangeBounds(selectedRange);
 
-  // Filter daily rows by model + date range
-  const filteredDaily = rawData.daily_by_model.filter(r =>
-    selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end)
+  // By model: hourly_by_model carries day+hour+model+project, so it doubles
+  // as the source for both the plain day-range filter and the Timeline's
+  // hour/minute cascading selection (daily_by_model is only used by the
+  // fixed top-3 Daily chart now -- see renderTopFixed).
+  const filteredHourly = (rawData.hourly_by_model || []).filter(r =>
+    selectedModels.has(r.model) && selectedProjects.has(r.project) &&
+    (!start || r.day >= start) && (!end || r.day <= end) &&
+    withinTimelineSelectionDayHour(r.day, r.hour)
   );
 
-  // Daily chart: aggregate by day
-  const dailyMap = {};
-  for (const r of filteredDaily) {
-    if (!dailyMap[r.day]) dailyMap[r.day] = { day: r.day, input: 0, output: 0, cache_read: 0, cache_creation: 0 };
-    const d = dailyMap[r.day];
-    d.input          += r.input;
-    d.output         += r.output;
-    d.cache_read     += r.cache_read;
-    d.cache_creation += r.cache_creation;
-  }
-  const daily = Object.values(dailyMap).sort((a, b) => a.day.localeCompare(b.day));
-
-  // By model: aggregate tokens + turns from daily data
   const modelMap = {};
-  for (const r of filteredDaily) {
+  for (const r of filteredHourly) {
     if (!modelMap[r.model]) modelMap[r.model] = { model: r.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0 };
     const m = modelMap[r.model];
     m.input          += r.input;
@@ -1581,9 +1852,12 @@ function applyFilter() {
     m.turns          += r.turns;
   }
 
-  // Filter sessions by model + date range
+  // Filter sessions by model + project + range + Timeline selection (true
+  // minute precision, since sessions carry a minute-precision timestamp).
   const filteredSessions = rawData.sessions_all.filter(s =>
-    selectedModels.has(s.model) && (!start || s.last_date >= start) && (!end || s.last_date <= end)
+    selectedModels.has(s.model) && selectedProjects.has(s.project) &&
+    (!start || s.last_date >= start) && (!end || s.last_date <= end) &&
+    withinTimelineSelectionMinute(s.last)
   );
 
   // Add session counts into modelMap
@@ -1608,14 +1882,15 @@ function applyFilter() {
   }
   const byProject = Object.values(projMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
-  // By skill (filtered by range + selected models). Cost is summed per source
-  // row (day+skill+model) rather than computed once on the aggregate, since a
-  // skill can be invoked under different models with different pricing.
+  // By skill. Cost is summed per source row (day+hour+skill+model+project)
+  // rather than computed once on the aggregate, since a skill can be invoked
+  // under different models with different pricing.
   const skillMap = {};
   for (const r of (rawData.skill_by_day || [])) {
-    if (!selectedModels.has(r.model)) continue;
+    if (!selectedModels.has(r.model) || !selectedProjects.has(r.project)) continue;
     if (start && r.day < start) continue;
     if (end && r.day > end) continue;
+    if (!withinTimelineSelectionDayHour(r.day, r.hour)) continue;
     const k = r.skill;
     if (!skillMap[k]) skillMap[k] = { skill: k, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, cost: 0 };
     const m = skillMap[k];
@@ -1626,14 +1901,16 @@ function applyFilter() {
   }
   const bySkill = Object.values(skillMap).sort((a, b) => b.cost - a.cost);
 
-  // By tool, MCP servers collapsed to "MCP: <server>" (see toolGroupLabel).
-  // Same per-row cost summing as bySkill above, for the same reason.
+  // By tool -- MCP servers collapsed to "MCP: <server>", Bash calls collapsed
+  // to "CLI: <name>" (see toolGroupLabel). Same per-row cost summing as
+  // bySkill above, for the same reason.
   const toolMap = {};
   for (const r of (rawData.tool_by_day || [])) {
-    if (!selectedModels.has(r.model)) continue;
+    if (!selectedModels.has(r.model) || !selectedProjects.has(r.project)) continue;
     if (start && r.day < start) continue;
     if (end && r.day > end) continue;
-    const k = toolGroupLabel(r.tool_name);
+    if (!withinTimelineSelectionDayHour(r.day, r.hour)) continue;
+    const k = toolGroupLabel(r.tool_name, r.cli_name);
     if (!toolMap[k]) toolMap[k] = { tool: k, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, cost: 0 };
     const m = toolMap[k];
     m.input += r.input; m.output += r.output;
@@ -1643,32 +1920,13 @@ function applyFilter() {
   }
   const byTool = Object.values(toolMap).sort((a, b) => b.cost - a.cost);
 
-  // Totals
-  const totals = {
-    sessions:       filteredSessions.length,
-    turns:          byModel.reduce((s, m) => s + m.turns, 0),
-    input:          byModel.reduce((s, m) => s + m.input, 0),
-    output:         byModel.reduce((s, m) => s + m.output, 0),
-    cache_read:     byModel.reduce((s, m) => s + m.cache_read, 0),
-    cache_creation: byModel.reduce((s, m) => s + m.cache_creation, 0),
-    cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation), 0),
-    subagent_tokens: (rawData.subagent_by_type || [])
-      .filter(r => selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end))
-      .reduce((s, r) => s + r.input + r.output + r.cache_read + r.cache_creation, 0),
-  };
-
-  // Hourly aggregation (filtered by model + range, then bucketed by UTC hour)
-  const hourlySrc = (rawData.hourly_by_model || []).filter(r =>
-    selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end)
-  );
-  const hourlyAgg = aggregateHourly(hourlySrc, hourlyTZ);
-
-  // Subagent breakdown by type (filtered by range + selected models)
+  // Subagent breakdown by type
   const subagentTypeMap = {};
   for (const r of (rawData.subagent_by_type || [])) {
-    if (!selectedModels.has(r.model)) continue;
+    if (!selectedModels.has(r.model) || !selectedProjects.has(r.project)) continue;
     if (start && r.day < start) continue;
     if (end && r.day > end) continue;
+    if (!withinTimelineSelectionDayHour(r.day, r.hour)) continue;
     const k = r.agent_type;
     if (!subagentTypeMap[k]) subagentTypeMap[k] = { agent_type: k, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0 };
     const m = subagentTypeMap[k];
@@ -1680,21 +1938,18 @@ function applyFilter() {
     (b.input + b.output + b.cache_read + b.cache_creation) -
     (a.input + a.output + a.cache_read + a.cache_creation));
 
-  // Top dispatches: filter by range + selected model. Keep the full filtered set
-  // (already ranked by tokens server-side) so the table can page it like Recent
-  // Sessions — show more/less plus CSV export of everything.
+  // Top dispatches: filter by range/model/project + Timeline selection (true
+  // minute precision, since dispatches carry a minute-precision start time).
+  // Keep the full filtered set (already ranked by tokens server-side) so the
+  // table can page it like Recent Sessions -- show more/less plus CSV export.
   const filteredDispatches = (rawData.top_dispatches || []).filter(d =>
-    selectedModels.has(d.model) && (!start || d.start_date >= start) && (!end || d.start_date <= end)
+    selectedModels.has(d.model) && selectedProjects.has(d.project) &&
+    (!start || d.start_date >= start) && (!end || d.start_date <= end) &&
+    withinTimelineSelectionMinute(d.start)
   );
 
-  // Update daily chart title
-  document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
-  document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution \u2014 ' + RANGE_LABELS[selectedRange];
-  document.getElementById('subagent-chart-title').textContent = 'Subagent Tokens by Type \u2014 ' + RANGE_LABELS[selectedRange];
+  document.getElementById('subagent-chart-title').textContent = 'Subagent Tokens by Type — ' + RANGE_LABELS[selectedRange];
 
-  renderStats(totals);
-  renderDailyChart(daily);
-  renderHourlyChart(hourlyAgg);
   renderModelChart(byModel);
   renderProjectChart(byProject);
   renderSubagentChart(byAgentType);
@@ -1713,9 +1968,67 @@ function applyFilter() {
   renderToolCostTable(lastByTool);
 }
 
+// ── Top-3 fixed sections (key metrics, Daily, Average Hourly) ──────────────
+// Always the last 30 days, all models, all projects -- completely independent
+// of the filter bar / Timeline selection below. Called once per data load
+// (initial + each auto-refresh poll), never from applyFilter().
+function renderTopFixed(d) {
+  const { start, end } = getRangeBounds('30d');
+
+  const filteredDaily = (d.daily_by_model || []).filter(r =>
+    (!start || r.day >= start) && (!end || r.day <= end)
+  );
+
+  const dailyMap = {};
+  for (const r of filteredDaily) {
+    if (!dailyMap[r.day]) dailyMap[r.day] = { day: r.day, input: 0, output: 0, cache_read: 0, cache_creation: 0 };
+    const m = dailyMap[r.day];
+    m.input += r.input; m.output += r.output;
+    m.cache_read += r.cache_read; m.cache_creation += r.cache_creation;
+  }
+  const daily = Object.values(dailyMap).sort((a, b) => a.day.localeCompare(b.day));
+
+  const modelMap = {};
+  for (const r of filteredDaily) {
+    if (!modelMap[r.model]) modelMap[r.model] = { model: r.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0 };
+    const m = modelMap[r.model];
+    m.input += r.input; m.output += r.output;
+    m.cache_read += r.cache_read; m.cache_creation += r.cache_creation;
+    m.turns += r.turns;
+  }
+  const byModel = Object.values(modelMap);
+
+  const filteredSessions = (d.sessions_all || []).filter(s =>
+    (!start || s.last_date >= start) && (!end || s.last_date <= end)
+  );
+
+  const totals = {
+    sessions:       filteredSessions.length,
+    turns:          byModel.reduce((s, m) => s + m.turns, 0),
+    input:          byModel.reduce((s, m) => s + m.input, 0),
+    output:         byModel.reduce((s, m) => s + m.output, 0),
+    cache_read:     byModel.reduce((s, m) => s + m.cache_read, 0),
+    cache_creation: byModel.reduce((s, m) => s + m.cache_creation, 0),
+    cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation), 0),
+    subagent_tokens: (d.subagent_by_type || [])
+      .filter(r => (!start || r.day >= start) && (!end || r.day <= end))
+      .reduce((s, r) => s + r.input + r.output + r.cache_read + r.cache_creation, 0),
+  };
+
+  const hourlySrc = (d.hourly_by_model || []).filter(r =>
+    (!start || r.day >= start) && (!end || r.day <= end)
+  );
+  const hourlyAgg = aggregateHourly(hourlySrc, hourlyTZ);
+
+  renderStats(totals);
+  renderDailyChart(daily);
+  renderHourlyChart(hourlyAgg);
+}
+
 // ── Renderers ──────────────────────────────────────────────────────────────
 function renderStats(t) {
-  const rangeLabel = RANGE_LABELS[selectedRange].toLowerCase();
+  // Fixed label — renderTopFixed() is the only caller, always a 30-day window.
+  const rangeLabel = 'last 30 days';
   const stats = [
     { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: rangeLabel },
     { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel },
@@ -2220,12 +2533,13 @@ function renderSkillCostTable(rows) {
 // Read, Edit, Skill, ...) is shown as its own tool name. Tolerates a server
 // name that itself contains "__" by treating everything between the first
 // and last segment as the server.
-function toolGroupLabel(toolName) {
+function toolGroupLabel(toolName, cliName) {
   if (!toolName) return 'unknown';
   if (toolName.startsWith('mcp__')) {
     const parts = toolName.split('__');
     return parts.length >= 3 ? 'MCP: ' + parts.slice(1, -1).join('__') : 'MCP: unknown';
   }
+  if (toolName === 'Bash' && cliName) return 'CLI: ' + cliName;
   return toolName;
 }
 
@@ -2398,12 +2712,16 @@ async function loadData() {
       selectedRange = readURLRange();
       const rangeSel = document.getElementById('range-select');
       if (rangeSel) rangeSel.value = selectedRange;
+      // Timeline granularity's default depends on the restored range, not the
+      // '30d' module-load default it was declared with.
+      timelineGranularity = defaultTimelineGranularity();
       // Mark default TZ button active
       document.querySelectorAll('.tz-btn').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.tz === hourlyTZ)
       );
-      // Build model filter (reads URL for model selection too)
+      // Build model/project filters (reads URL for selection too)
       buildFilterUI(d.all_models);
+      buildProjectFilterUI(d.all_projects || []);
       updateSortIcons();
       updateModelSortIcons();
       updateProjectSortIcons();
@@ -2412,6 +2730,7 @@ async function loadData() {
       fetchTimeline();
     }
 
+    renderTopFixed(d);
     applyFilter();
   } catch(e) {
     console.error(e);

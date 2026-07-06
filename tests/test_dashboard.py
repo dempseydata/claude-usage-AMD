@@ -261,8 +261,17 @@ class TestGetTimelineData(unittest.TestCase):
         os.unlink(self.db_path)
 
     def test_rejects_invalid_granularity(self):
-        data = get_timeline_data(db_path=self.db_path, granularity="day")
+        data = get_timeline_data(db_path=self.db_path, granularity="week")
         self.assertIn("error", data)
+
+    def test_day_granularity_buckets_by_date(self):
+        data = get_timeline_data(
+            db_path=self.db_path, granularity="day",
+            start="2026-04-08", end="2026-04-08",
+        )
+        self.assertNotIn("error", data)
+        buckets = {r["bucket"] for r in data["rows"]}
+        self.assertEqual(buckets, {"2026-04-08"})
 
     def test_minute_requires_bounded_range(self):
         data = get_timeline_data(db_path=self.db_path, granularity="minute")
