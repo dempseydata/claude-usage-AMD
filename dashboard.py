@@ -1130,9 +1130,15 @@ function defaultTimelineGranularity() {
 // subset of the currently-visible Hour buckets -- otherwise there's nothing
 // meaningful to zoom into at minute resolution.
 function timelineMinuteAllowed() {
-  return timelineGranularity === 'hour' && !!timelineSelection &&
-    timelineBuckets.length > 0 &&
-    (timelineSelection.start !== timelineBuckets[0] || timelineSelection.end !== timelineBuckets[timelineBuckets.length - 1]);
+  if (timelineGranularity !== 'hour' || !timelineSelection) return false;
+  // Compare against the FULL (un-narrowed) hour range for the current day
+  // range, not timelineBuckets — once a selection is active, renderTimelineChart
+  // narrows timelineBuckets to match it, so comparing against timelineBuckets
+  // would always find "selection == whole visible chart" and stay disabled.
+  const { start, end } = getRangeBounds(selectedRange);
+  const fullBuckets = timelineExpectedBuckets(start, end, 'hour', null) || [];
+  if (!fullBuckets.length) return false;
+  return timelineSelection.start !== fullBuckets[0] || timelineSelection.end !== fullBuckets[fullBuckets.length - 1];
 }
 
 // Advance a plain 'YYYY-MM-DD' string by `delta` days, anchored in UTC so the
@@ -1811,18 +1817,32 @@ function applyFilter() {
 
   const byModel = Object.values(modelMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
-  // By project: aggregate from filtered sessions
+  // By project: token/turn/cost totals come from filteredHourly (turn-level,
+  // same source as byModel above) rather than sessions, since a session's
+  // last-activity timestamp can fall outside an active hour/minute Timeline
+  // selection even though real turns from that session happened inside it —
+  // aggregating from sessions there silently dropped whole projects.
+  // "Sessions" count is a separate, coarser metric: how many sessions in
+  // sessions_all touched this project in the day-range/model/project filter
+  // (a session doesn't cleanly map onto a sub-day Timeline selection, so that
+  // finer cascade isn't applied to this one column).
   const projMap = {};
-  for (const s of filteredSessions) {
-    if (!projMap[s.project]) projMap[s.project] = { project: s.project, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0, cost: 0 };
-    const p = projMap[s.project];
-    p.input          += s.input;
-    p.output         += s.output;
-    p.cache_read     += s.cache_read;
-    p.cache_creation += s.cache_creation;
-    p.turns          += s.turns;
-    p.sessions++;
-    p.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+  for (const r of filteredHourly) {
+    if (!projMap[r.project]) projMap[r.project] = { project: r.project, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0, cost: 0 };
+    const p = projMap[r.project];
+    p.input          += r.input;
+    p.output         += r.output;
+    p.cache_read     += r.cache_read;
+    p.cache_creation += r.cache_creation;
+    p.turns          += r.turns;
+    p.cost += calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation);
+  }
+  const sessionsForCount = rawData.sessions_all.filter(s =>
+    selectedModels.has(s.model) && selectedProjects.has(s.project) &&
+    (!start || s.last_date >= start) && (!end || s.last_date <= end)
+  );
+  for (const s of sessionsForCount) {
+    if (projMap[s.project]) projMap[s.project].sessions++;
   }
   const byProject = Object.values(projMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
