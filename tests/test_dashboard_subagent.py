@@ -51,7 +51,6 @@ class TestDashboardSubagentData(unittest.TestCase):
     def test_returns_subagent_keys(self):
         d = dashboard.get_dashboard_data(self.db_path)
         self.assertIn("subagent_by_type", d)
-        self.assertIn("top_dispatches", d)
 
     def test_subagent_by_type_resolves_agent_type(self):
         d = dashboard.get_dashboard_data(self.db_path)
@@ -60,12 +59,11 @@ class TestDashboardSubagentData(unittest.TestCase):
         self.assertIn("Explore", types)
         self.assertIn("auto-compact", types)
 
-    def test_top_dispatches_carries_dispatch_metadata(self):
+    def test_subagent_by_type_carries_dispatch_metadata(self):
         d = dashboard.get_dashboard_data(self.db_path)
-        explore = [r for r in d["top_dispatches"] if r["agent_type"] == "Explore"]
+        explore = [r for r in d["subagent_by_type"] if r["agent_type"] == "Explore"]
         self.assertEqual(len(explore), 1)
-        self.assertEqual(explore[0]["tool_uses"], 5)
-        self.assertEqual(explore[0]["duration_ms"], 4200)
+        self.assertEqual(explore[0]["dispatches"], 1)
         self.assertEqual(explore[0]["turns"], 1)
 
     def test_main_turn_excluded_from_subagent_data(self):
@@ -114,7 +112,6 @@ class TestDashboardOnUnmigratedDB(unittest.TestCase):
         d = dashboard.get_dashboard_data(self.db_path)
         self.assertNotIn("error", d)
         self.assertEqual(d["subagent_by_type"], [])
-        self.assertEqual(d["top_dispatches"], [])
         # The pre-existing main turn still renders in the normal sections.
         self.assertIn("claude-opus-4-8", d["all_models"])
 

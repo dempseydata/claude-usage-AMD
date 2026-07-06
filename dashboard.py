@@ -214,49 +214,6 @@ def get_dashboard_data(db_path=DB_PATH):
         "turns":          r["turns"] or 0,
     } for r in subagent_daily_rows]
 
-    # ── Top individual subagent dispatches (one row per agent_id) ─────────────
-    top_dispatch_rows = conn.execute(f"""
-        SELECT
-            t.agent_id                               as agent_id,
-            {AGENT_TYPE_EXPR}                        as agent_type,
-            COALESCE(NULLIF(t.model, ''), 'unknown') as model,
-            COALESCE(NULLIF(s.project_name, ''), 'unknown') as project,
-            MIN(t.timestamp)                         as start_ts,
-            SUM(t.input_tokens)                      as input,
-            SUM(t.output_tokens)                     as output,
-            SUM(t.cache_read_tokens)                 as cache_read,
-            SUM(t.cache_creation_tokens)             as cache_creation,
-            COUNT(*)                                 as turns,
-            a.dispatched_in_session                  as parent_session,
-            a.total_duration_ms                      as duration_ms,
-            a.tool_use_count                         as tool_uses,
-            a.status                                 as status
-        FROM turns t
-        LEFT JOIN agents a ON t.agent_id = a.agent_id
-        LEFT JOIN sessions s ON s.session_id = a.dispatched_in_session
-        WHERE t.is_subagent = 1 AND t.agent_id IS NOT NULL
-        GROUP BY t.agent_id
-        ORDER BY (SUM(t.input_tokens) + SUM(t.output_tokens)
-                  + SUM(t.cache_read_tokens) + SUM(t.cache_creation_tokens)) DESC
-    """).fetchall()
-
-    top_dispatches = [{
-        "agent_id":       r["agent_id"],
-        "agent_type":     r["agent_type"],
-        "model":          r["model"],
-        "project":        r["project"],
-        "start":          (r["start_ts"] or "")[:16].replace("T", " "),
-        "start_date":     (r["start_ts"] or "")[:10],
-        "input":          r["input"] or 0,
-        "output":         r["output"] or 0,
-        "cache_read":     r["cache_read"] or 0,
-        "cache_creation": r["cache_creation"] or 0,
-        "turns":          r["turns"] or 0,
-        "duration_ms":    r["duration_ms"],
-        "tool_uses":      r["tool_uses"],
-        "status":         r["status"],
-    } for r in top_dispatch_rows]
-
     # ── Skill usage, by day/hour, model & project ─────────────────────────────
     # skill_name is only populated for tool_name='Skill' turns (see scanner.py) —
     # every other turn has it NULL and is excluded here.
@@ -341,7 +298,6 @@ def get_dashboard_data(db_path=DB_PATH):
         "hourly_by_model": hourly_by_model,
         "sessions_all":    sessions_all,
         "subagent_by_type": subagent_by_type,
-        "top_dispatches":  top_dispatches,
         "skill_by_day":    skill_by_day,
         "tool_by_day":     tool_by_day,
         "generated_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -485,9 +441,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     mask: url("icon.svg") no-repeat center / contain;
   }
   header .meta { color: var(--muted); font-size: 12px; text-align: right; line-height: 1.5; margin-right: 20px; }
-  #rescan-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; margin-top: 4px; }
+  #rescan-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
   #rescan-btn:hover { color: var(--text); border-color: var(--accent); }
   #rescan-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .autorefresh-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; white-space: nowrap; }
+  .autorefresh-toggle input { cursor: pointer; }
 
   /* No longer a full-bleed sticky top bar — it lives between the fixed 30-day
      overview and the filterable sections, so it reads as a card like the rest. */
@@ -605,7 +563,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
      the same control strip. It pins to the viewport top once the header/filter
      scroll away. z-index sits below the model panel (50) so the dropdown still
      overlays it. */
-  /* Inline info affordance (e.g. the dispatches table) — native title tooltip. */
+  /* Inline info affordance — native title tooltip. */
   .info-icon { display: inline-flex; align-items: center; vertical-align: middle; margin-left: 3px; color: var(--muted); cursor: help; }
   .info-icon svg { display: block; }
   .info-icon:hover { color: var(--text); }
@@ -636,7 +594,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <h1>Claude Code Usage</h1>
   </div>
   <div class="meta" id="meta">Loading...</div>
-  <button id="rescan-btn" onclick="triggerRescan()" title="Scan for new usage since the last update. Adds new turns without affecting existing history.">&#x21bb; Rescan</button>
 </header>
 
 <div class="container">
@@ -707,6 +664,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <option value="all">All Time</option>
       </select>
     </div>
+    <div class="filter-sep"></div>
+    <label class="autorefresh-toggle" for="autorefresh-checkbox">
+      <input type="checkbox" id="autorefresh-checkbox" onchange="setAutoRefreshEnabled(this.checked)">
+      Auto-refresh (30s)
+    </label>
+    <button id="rescan-btn" onclick="triggerRescan()" title="Scan for new usage since the last update. Adds new turns without affecting existing history.">&#x21bb; Rescan</button>
     <div class="filter-hint">Filters below apply to everything from Usage Timeline down.</div>
   </div>
 
@@ -764,17 +727,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <tbody id="model-cost-body"></tbody>
     </table>
     <div class="table-foot" id="model-cost-foot"></div>
-  </div>
-  <div class="table-card" id="sec-dispatches" data-card="dispatches">
-    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Top Subagent Dispatches <span class="info-icon" tabindex="0" role="img" aria-label="About this table" title="Ranked by total tokens. &quot;unknown&quot; means the parent dispatch record wasn't found."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><button class="export-btn" onclick="exportDispatchesCSV()" title="Export all filtered subagent dispatches to CSV">&#x2913; CSV</button></div>
-    <table>
-      <thead><tr>
-        <th>Type</th><th>Started</th><th>Model</th><th>Turns</th><th>Tool Uses</th>
-        <th>Duration</th><th>Input</th><th>Output</th><th>Cache Read</th><th>Tokens</th><th>Est. Cost</th>
-      </tr></thead>
-      <tbody id="dispatches-body"></tbody>
-    </table>
-    <div class="table-foot" id="dispatches-foot"></div>
   </div>
   <div class="table-card" id="sec-skill-cost" data-card="cost-by-skill">
     <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Token Usage by Skill</div><button class="export-btn" onclick="exportSkillsCSV()" title="Export all filtered skill usage to CSV">&#x2913; CSV</button></div>
@@ -886,7 +838,6 @@ let lastByModel = [];
 let lastByProject = [];
 let lastBySkill = [];
 let lastByTool = [];
-let lastFilteredDispatches = [];
 let sessionSortDir = 'desc';
 
 // Tables reveal rows in steps: 10 -> 25 -> 50, capped at 50 because rendering
@@ -917,7 +868,6 @@ let sessionsLimit = TABLE_STEPS[0];
 let projectLimit = TABLE_STEPS[0];
 let skillLimit = TABLE_STEPS[0];
 let toolLimit = TABLE_STEPS[0];
-let dispatchesLimit = TABLE_STEPS[0];
 let hourlyTZ = 'local';  // 'local' or 'utc'
 
 // ── Peak-hour config ───────────────────────────────────────────────────────
@@ -1058,25 +1008,6 @@ const TOKEN_HOVER = {
 // blue, mauve, ochre, taupe, terracotta) rather than a saturated rainbow.
 const MODEL_COLORS = ['#D97757','#C9A26B','#7FA98C','#6E97A8','#B98AA0','#D9A84E','#A88B6A','#C2705A'];
 
-// Subagent type swatches (table tag tint) — warm/neutral, matching the palette.
-const AGENT_TYPE_COLORS = {
-  'general-purpose':   '#6E97A8',
-  'Explore':           '#9B7EC7',
-  'Plan':              '#D9A84E',
-  'claude-code-guide': '#48A0C7',
-  'auto-compact':      '#A88B6A',
-  'unknown':           '#4F4F50',
-};
-function colorForAgentType(t) { return AGENT_TYPE_COLORS[t] || '#7FA98C'; }
-function fmtDuration(ms) {
-  if (!ms || ms < 0) return '—';
-  const s = Math.round(ms / 1000);
-  if (s < 60) return s + 's';
-  const m = Math.floor(s / 60), r = s % 60;
-  if (m < 60) return r ? `${m}m${r}s` : `${m}m`;
-  const h = Math.floor(m / 60);
-  return `${h}h${m % 60}m`;
-}
 
 // Tooltip color swatches: solid fill, no border (Chart.js's default draws a
 // bordered box that looked offset/inconsistent). Lines use their solid stroke
@@ -1176,6 +1107,7 @@ function setRange(range) {
   updateURL();
   applyFilter();
   scheduleAutoRefresh();
+  updateMetaRefreshNote();
   fetchTimeline();  // range changed -> Usage Timeline is server-scoped, needs a fresh query
 }
 
@@ -1339,8 +1271,25 @@ let timelineFilteredRows = [];
 function renderTimelineChart(rows) {
   timelineFilteredRows = rows;
 
+  const { start, end } = getRangeBounds(selectedRange);
+  let buckets = timelineExpectedBuckets(start, end, timelineGranularity, timelineMinuteWindow)
+    || [...new Set(rows.map(r => r.bucket))].sort();
+
+  // An active drag-selection narrows the chart itself, not just the tables
+  // below it — otherwise the chart looks unfiltered while everything below
+  // silently isn't, which reads as a bug rather than the cascade it is.
+  if (timelineSelection) {
+    const sIdx = buckets.indexOf(timelineSelection.start);
+    const eIdx = buckets.indexOf(timelineSelection.end);
+    if (sIdx !== -1 && eIdx !== -1) buckets = buckets.slice(sIdx, eIdx + 1);
+  }
+  timelineBuckets = buckets;
+
+  const bucketSet = new Set(buckets);
+  const visibleRows = rows.filter(r => bucketSet.has(r.bucket));
+
   const projTotals = {};
-  for (const r of rows) {
+  for (const r of visibleRows) {
     const tok = r.input + r.output + r.cache_read + r.cache_creation;
     projTotals[r.project] = (projTotals[r.project] || 0) + tok;
   }
@@ -1354,15 +1303,10 @@ function renderTimelineChart(rows) {
   const hasOther = Object.keys(projTotals).length > topProjects.length;
   const labels = hasOther ? [...topProjects, 'Other'] : topProjects;
 
-  const { start, end } = getRangeBounds(selectedRange);
-  const buckets = timelineExpectedBuckets(start, end, timelineGranularity, timelineMinuteWindow)
-    || [...new Set(rows.map(r => r.bucket))].sort();
-  timelineBuckets = buckets;
   const bucketIndex = new Map(buckets.map((b, i) => [b, i]));
   const seriesMap = {};
   for (const label of labels) seriesMap[label] = buckets.map(() => 0);
-  for (const r of rows) {
-    if (!bucketIndex.has(r.bucket)) continue;  // outside the current minute window, if any
+  for (const r of visibleRows) {
     const key = topSet.has(r.project) ? r.project : (hasOther ? 'Other' : null);
     if (!key) continue;
     seriesMap[key][bucketIndex.get(r.bucket)] += r.input + r.output + r.cache_read + r.cache_creation;
@@ -1370,7 +1314,7 @@ function renderTimelineChart(rows) {
 
   const ctx = document.getElementById('chart-timeline').getContext('2d');
   if (charts.timeline) charts.timeline.destroy();
-  if (!buckets.length) { charts.timeline = null; renderTimelineProjectTable(rows, null); return; }
+  if (!buckets.length) { charts.timeline = null; renderTimelineProjectTable(visibleRows, timelineSelection); return; }
 
   charts.timeline = new Chart(ctx, {
     type: 'bar',
@@ -1416,7 +1360,7 @@ function renderTimelineChart(rows) {
   // canvas rather than through a chart option.
   ctx.canvas.ondblclick = resetTimelineSelection;
 
-  renderTimelineProjectTable(rows, timelineSelection);
+  renderTimelineProjectTable(visibleRows, timelineSelection);
 }
 
 // Reads the zoomed x-axis range (bar-index based, since our x scale is a
@@ -1434,10 +1378,10 @@ function applyTimelineSelectionFromChart(chart) {
     timelineSelection = { start: timelineBuckets[minIdx], end: timelineBuckets[maxIdx] };
   }
   updateTimelineButtons();  // Minute availability may have just changed
-  const selectedBuckets = timelineSelection ? new Set(timelineBuckets.slice(minIdx, maxIdx + 1)) : null;
-  const subset = selectedBuckets ? timelineFilteredRows.filter(r => selectedBuckets.has(r.bucket)) : timelineFilteredRows;
-  renderTimelineProjectTable(subset, timelineSelection);
-  applyFilter();  // cascade the selection to everything below the Timeline chart
+  // applyFilter -> refilterTimeline -> renderTimelineChart re-renders the
+  // Timeline chart itself narrowed to the selection (not just the side table
+  // or the stuff below it), plus cascades the selection everywhere else.
+  applyFilter();
 }
 
 function resetTimelineSelection() {
@@ -1811,7 +1755,7 @@ function withinTimelineSelectionDayHour(day, hour) {
   return key >= start.slice(0, 13) + ':00' && key <= end.slice(0, 13) + ':00';
 }
 
-// Does a "YYYY-MM-DD HH:MM" timestamp (sessions/dispatches -- minute precision
+// Does a "YYYY-MM-DD HH:MM" timestamp (sessions carry minute precision
 // already) fall inside the active Timeline selection? True precision here,
 // unlike the day-hour version above.
 function withinTimelineSelectionMinute(ts) {
@@ -1938,24 +1882,12 @@ function applyFilter() {
     (b.input + b.output + b.cache_read + b.cache_creation) -
     (a.input + a.output + a.cache_read + a.cache_creation));
 
-  // Top dispatches: filter by range/model/project + Timeline selection (true
-  // minute precision, since dispatches carry a minute-precision start time).
-  // Keep the full filtered set (already ranked by tokens server-side) so the
-  // table can page it like Recent Sessions -- show more/less plus CSV export.
-  const filteredDispatches = (rawData.top_dispatches || []).filter(d =>
-    selectedModels.has(d.model) && selectedProjects.has(d.project) &&
-    (!start || d.start_date >= start) && (!end || d.start_date <= end) &&
-    withinTimelineSelectionMinute(d.start)
-  );
-
   document.getElementById('subagent-chart-title').textContent = 'Subagent Tokens by Type — ' + RANGE_LABELS[selectedRange];
 
   renderModelChart(byModel);
   renderProjectChart(byProject);
   renderSubagentChart(byAgentType);
   refilterTimeline();  // cheap client-side re-filter of already-fetched timeline rows
-  lastFilteredDispatches = filteredDispatches;
-  renderTopDispatches(lastFilteredDispatches);
   lastFilteredSessions = sortSessions(filteredSessions);
   lastByModel = byModel;
   lastByProject = sortProjects(byProject);
@@ -2279,39 +2211,6 @@ function renderSubagentChart(byType) {
   });
 }
 
-function renderTopDispatches(rows) {
-  const body = document.getElementById('dispatches-body');
-  if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="11" class="muted" style="text-align:center;padding:24px">No subagent dispatches in selected range.</td></tr>';
-    renderTableToggle('dispatches-foot', 0, dispatchesLimit, 'lessDispatchRows', 'moreDispatchRows', 'exportDispatchesCSV');
-    return;
-  }
-  const shown = rows.slice(0, shownCount(dispatchesLimit, rows.length));
-  body.innerHTML = shown.map(d => {
-    const tokensTotal = d.input + d.output + d.cache_read + d.cache_creation;
-    const cost = calcCost(d.model, d.input, d.output, d.cache_read, d.cache_creation);
-    const costCell = isBillable(d.model)
-      ? `<td class="cost">${fmtCost(cost)}</td>`
-      : `<td class="cost-na">n/a</td>`;
-    const col = colorForAgentType(d.agent_type);
-    const typeStyle = `background:${col}22;color:${col};border:1px solid ${col}44`;
-    return `<tr>
-      <td><span class="model-tag" style="${typeStyle}">${esc(d.agent_type)}</span></td>
-      <td class="muted">${esc(d.start || '—')}</td>
-      <td><span class="model-tag">${esc(d.model)}</span></td>
-      <td class="num">${d.turns}</td>
-      <td class="num">${d.tool_uses != null ? d.tool_uses : '—'}</td>
-      <td class="muted">${fmtDuration(d.duration_ms)}</td>
-      <td class="num">${fmt(d.input)}</td>
-      <td class="num">${fmt(d.output)}</td>
-      <td class="num">${fmt(d.cache_read)}</td>
-      <td class="num"><strong>${fmt(tokensTotal)}</strong></td>
-      ${costCell}
-    </tr>`;
-  }).join('');
-  renderTableToggle('dispatches-foot', rows.length, dispatchesLimit, 'lessDispatchRows', 'moreDispatchRows', 'exportDispatchesCSV');
-}
-
 // Fills a table card's footer with the row-reveal control. Three states:
 //   - more rows fit under the cap        -> "Show more" (plus "Show less" once expanded)
 //   - cap reached but more records exist -> "Download CSV to see all (N)" + "Show less"
@@ -2356,8 +2255,6 @@ function moreSkillRows()   { skillLimit    = nextTableLimit(skillLimit,    lastB
 function lessSkillRows()   { skillLimit    = TABLE_STEPS[0]; renderSkillCostTable(lastBySkill);            scrollTableToTop('skill-cost-body'); }
 function moreToolRows()    { toolLimit     = nextTableLimit(toolLimit,     lastByTool.length);         renderToolCostTable(lastByTool); }
 function lessToolRows()    { toolLimit     = TABLE_STEPS[0]; renderToolCostTable(lastByTool);              scrollTableToTop('tool-cost-body'); }
-function moreDispatchRows(){ dispatchesLimit = nextTableLimit(dispatchesLimit, lastFilteredDispatches.length); renderTopDispatches(lastFilteredDispatches); }
-function lessDispatchRows(){ dispatchesLimit = TABLE_STEPS[0]; renderTopDispatches(lastFilteredDispatches);            scrollTableToTop('dispatches-body'); }
 
 function renderSessionsTable(sessions) {
   const shown = sessions.slice(0, shownCount(sessionsLimit, sessions.length));
@@ -2657,18 +2554,6 @@ function exportToolsCSV() {
   downloadCSV('tools', header, rows);
 }
 
-function exportDispatchesCSV() {
-  const header = ['Type', 'Agent ID', 'Started', 'Model', 'Turns', 'Tool Uses', 'Duration (ms)', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Total Tokens', 'Est. Cost', 'Status'];
-  const rows = lastFilteredDispatches.map(d => {
-    const total = d.input + d.output + d.cache_read + d.cache_creation;
-    const cost = calcCost(d.model, d.input, d.output, d.cache_read, d.cache_creation);
-    return [d.agent_type, d.agent_id, d.start, d.model, d.turns,
-            d.tool_uses != null ? d.tool_uses : '', d.duration_ms != null ? d.duration_ms : '',
-            d.input, d.output, d.cache_read, d.cache_creation, total, cost.toFixed(4), d.status || ''];
-  });
-  downloadCSV('subagent_dispatches', header, rows);
-}
-
 // ── Rescan ────────────────────────────────────────────────────────────────
 async function triggerRescan() {
   const btn = document.getElementById('rescan-btn');
@@ -2701,7 +2586,7 @@ async function loadData() {
       if (rawData === null) setTimeout(loadData, 3000);
       return;
     }
-    const refreshNote = rangeIncludesToday(selectedRange) ? '<br>Auto-refresh in 30s' : '';
+    const refreshNote = (autoRefreshEnabled && rangeIncludesToday(selectedRange)) ? '<br>Auto-refresh in 30s' : '';
     document.getElementById('meta').innerHTML = 'Updated: ' + esc(d.generated_at) + refreshNote;
 
     const isFirstLoad = rawData === null;
@@ -2738,9 +2623,26 @@ async function loadData() {
 }
 
 let autoRefreshTimer = null;
+let autoRefreshEnabled = false;  // opt-in — unchecked by default
+
+function setAutoRefreshEnabled(enabled) {
+  autoRefreshEnabled = enabled;
+  scheduleAutoRefresh();
+  updateMetaRefreshNote();
+}
+
+// Keeps the "Auto-refresh in 30s" note in the meta line in sync with the
+// checkbox immediately, rather than waiting for the next actual data load.
+function updateMetaRefreshNote() {
+  const meta = document.getElementById('meta');
+  if (!meta || !rawData) return;
+  const refreshNote = (autoRefreshEnabled && rangeIncludesToday(selectedRange)) ? '<br>Auto-refresh in 30s' : '';
+  meta.innerHTML = 'Updated: ' + esc(rawData.generated_at) + refreshNote;
+}
+
 function scheduleAutoRefresh() {
   if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
-  if (rangeIncludesToday(selectedRange)) {
+  if (autoRefreshEnabled && rangeIncludesToday(selectedRange)) {
     autoRefreshTimer = setInterval(loadData, 30000);
   }
 }
